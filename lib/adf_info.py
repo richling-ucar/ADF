@@ -33,6 +33,7 @@ import copy
 import os
 import getpass
 import subprocess
+import time
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++
 #import non-standard python modules, including ADF
@@ -44,7 +45,6 @@ import xarray as xr
 # pylint: enable=unused-import
 
 #ADF modules:
-import adf_utils as utils
 from adf_config import AdfConfig
 from adf_base   import AdfError
 
@@ -68,6 +68,9 @@ class AdfInfo(AdfConfig):
 
         #Initialize Config attributes:
         super().__init__(config_file, debug=debug)
+
+        #Save config file name
+        self.__config_file = config_file
 
         #Add basic diagnostic info to object:
         self.__basic_info = self.read_config_var('diag_basic_info', required=True)
@@ -96,6 +99,17 @@ class AdfInfo(AdfConfig):
         if self.__mdtf_info is not None:
             self.expand_references(self.__mdtf_info)
         # End if
+
+        self.__campaigns = self.read_config_var('campaigns')
+        self.expand_references(self.__campaigns)
+        print("\nself.__campaigns",self.__campaigns,"\n")
+
+        """self.__satellites = self.read_config_var('satellites')
+        self.expand_references(self.__satellites)
+
+        self.__models = self.read_config_var('models')
+        self.expand_references(self.__models)
+        """
 
         # Get the current system user
         self.__user = getpass.getuser()
@@ -128,10 +142,13 @@ class AdfInfo(AdfConfig):
             else:
                 # If not a list, replicate the scalar value for each case
                 self.__cam_climo_info[conf_var] = [conf_val] * self.__num_cases
-        # End for
+            #End if
+        #End for
 
         #Initialize ADF variable list:
-        self.__diag_var_list = self.read_config_var('diag_var_list', required=True)
+        self.__diag_var_list = self.read_config_var('diag_var_list') #, required=True
+        if not self.__diag_var_list:
+            self.__diag_var_list = []
 
         #Case names:
         case_names = self.get_cam_info('cam_case_name', required=True)
@@ -156,6 +173,8 @@ class AdfInfo(AdfConfig):
         #End if
 
         self.__base_hist_str = ""
+
+        self.__inform_diags = self.get_basic_info('inform_diags')
 
         #Initialize "compare_obs" variable:
         self.__compare_obs = self.get_basic_info('compare_obs')
@@ -201,156 +220,160 @@ class AdfInfo(AdfConfig):
             #Check if any time series files are pre-made
             baseline_ts_done   = self.get_baseline_info("cam_ts_done")
 
-            #Check if time series files already exist,
-            #if so don't rely on climo years from history location
-            if baseline_ts_done:
-                baseline_hist_locs = None
-
-                #Grab baseline time series file location
-                input_ts_baseline = self.get_baseline_info("cam_ts_loc", required=True)
-                input_ts_loc = Path(input_ts_baseline)
-
-                #Get years from pre-made timeseries file(s)
-                found_syear_baseline, found_eyear_baseline = self.get_climo_yrs_from_ts(
-                    input_ts_loc, data_name, hist_str=baseline_hist_str)
-
-                #History file path isn't needed if user is running ADF directly on time series.
-                #So make sure start and end year are specified:
-                if syear_baseline is None:
-                    msg = f"\t WARNING: No given start year for {data_name}, "
-                    msg += f"using first found year: {found_syear_baseline}"
-                    print(msg)
-                    syear_baseline = found_syear_baseline
-                if not found_syear_baseline <= syear_baseline <= found_eyear_baseline:
-                    msg = f"\t WARNING: Given start year '{syear_baseline}' is not in current "
-                    msg += f"dataset {data_name}, using first found year: {found_syear_baseline}"
-                    print(msg)
-                    syear_baseline = found_syear_baseline
-
-                if eyear_baseline is None:
-                    msg = f"\t WARNING: No given end year for {data_name}, "
-                    msg += f"using last found year: {found_eyear_baseline}"
-                    print(msg)
-                    eyear_baseline = found_eyear_baseline
-                if not found_syear_baseline <= eyear_baseline <= found_eyear_baseline:
-                    msg = f"\t WARNING: Given end year '{eyear_baseline}' is not in current "
-                    msg += f"dataset {data_name}, using last found year: {found_eyear_baseline}"
-                    print(msg)
-                    eyear_baseline = found_eyear_baseline
-            # End if
-
-            # Check if history file path exists:
-            elif baseline_hist_locs and any(baseline_hist_locs):
-                #Check if user provided
-                if not baseline_hist_str:
-                    baseline_hist_str = ['cam.h0a']
-                else:
-                    #Make list if not already
-                    if not isinstance(baseline_hist_str, list):
-                        baseline_hist_str = [baseline_hist_str]
-                #Initialize baseline history string list
-                self.__base_hist_str = baseline_hist_str
-
-                #Grab first possible hist string, just looking for years of run
-                base_hist_str = baseline_hist_str[0]
-                starting_location = Path(baseline_hist_locs)
-                print(f"\tChecking history files in '{starting_location}'")
-
-                #Check if the history file location exists
-                if not starting_location.is_dir():
-                    msg = "Checking history file location:\n"
-                    msg += f"\tThere is no history file location: '{starting_location}'."
-                    self.debug_log(msg)
-                    emsg = f"{data_name} starting_location: History file location not found!\n"
-                    emsg += "\tTry checking the path 'cam_hist_loc' in 'diag_cam_baseline_climo' "
-                    emsg += "section in your config file is correct..."
-                    self.end_diag_fail(emsg)
-                file_list = sorted(starting_location.glob("*" + base_hist_str + ".*.nc"))
-
-                #Check if there are any history files
-                if len(file_list) == 0:
-                    msg = "Checking history files:\n"
-                    msg += f"\tThere are no history files in '{starting_location}'."
-                    self.debug_log(msg)
-                    emsg = f"{data_name} starting_location {starting_location}: "
-                    emsg += f"No history files found for {base_hist_str}!\n"
-                    emsg += "\tTry checking the path 'cam_hist_loc' or the 'hist_str' "
-                    emsg += " in 'diag_cam_baseline_climo' "
-                    emsg += "section in your config file are correct..."
-                    self.end_diag_fail(emsg)
-
-                # Partition string to find exactly where h-number is
-                # This cuts the string before and after the `{hist_str}.` sub-string
-                # so there will always be three parts:
-                # before sub-string, sub-string, and after sub-string
-                #Since the last part always includes the time range, grab that with last index (2)
-                #NOTE: this is based off the current CAM file name structure in the form:
-                #  $CASE.cam.h#.YYYY<other date info>.nc
-                base_climo_yrs = [int(str(i).partition(f"{base_hist_str}.")[2][0:4]) for i in file_list]
-                if not base_climo_yrs:
-                    msg = f"\t ERROR: No climo years found in {baseline_hist_locs}, "
-                    raise AdfError(msg)
-
-                base_climo_yrs = sorted(np.unique(base_climo_yrs))
-
-                base_found_syr = int(base_climo_yrs[0])
-                base_found_eyr = int(base_climo_yrs[-1])
-
-                #Check if start or end year is missing. If so then just assume it is the
-                #start or end of the entire available model data.
-                if syear_baseline is None:
-                    msg = f"\t WARNING: No given start year for {data_name}, "
-                    msg += f"using first found year: {base_found_syr}"
-                    print(msg)
-                    syear_baseline = base_found_syr
-                if not base_found_syr <= syear_baseline <= base_found_eyr:
-                    msg = f"\t WARNING: Given start year '{syear_baseline}' is not in current "
-                    msg += f"dataset {data_name}, using first found year: {base_climo_yrs[0]}"
-                    print(msg)
-                    syear_baseline = base_found_syr
-
-                if eyear_baseline is None:
-                    msg = f"\t WARNING: No given end year for {data_name}, "
-                    msg += f"using last found year: {base_found_eyr}"
-                    print(msg)
-                    eyear_baseline = base_found_eyr
-                if not base_found_syr <= eyear_baseline <= base_found_eyr:
-                    msg = f"\t WARNING: Given end year '{eyear_baseline}' is not in current "
-                    msg += f"dataset {data_name}, using last found year: {base_climo_yrs[-1]}"
-                    print(msg)
-                    eyear_baseline = base_found_eyr
-
+            if self.__inform_diags:
+                print()
             else:
-                #Neither pre-made time series nor a history file location was provided,
-                #so years can only come from explicit start_year/end_year config entries.
-                if (syear_baseline is None) or (eyear_baseline is None):
-                    emsg = f"Unable to determine baseline years for '{data_name}'.\n"
-                    emsg += "\tProvide 'cam_ts_loc' (with 'cam_ts_done'), or 'cam_hist_loc', or "
-                    emsg += "explicit 'start_year' and 'end_year' in the 'diag_cam_baseline_climo' "
-                    emsg += "section of your config file."
-                    self.end_diag_fail(emsg)
-            #End if
+                #Check if time series files already exist,
+                #if so don't rely on climo years from history location
+                if baseline_ts_done:
+                    baseline_hist_locs = None
 
-            #Grab baseline nickname
-            base_nickname = self.get_baseline_info('case_nickname')
-            if base_nickname is None:
-                base_nickname = data_name
+                    #Grab baseline time series file location
+                    input_ts_baseline = self.get_baseline_info("cam_ts_loc", required=True)
+                    input_ts_loc = Path(input_ts_baseline)
 
-            #Get integer for baseline years for searching climo files
-            syear_baseline = int(syear_baseline)
-            eyear_baseline = int(eyear_baseline)
+                    #Get years from pre-made timeseries file(s)
+                    found_syear_baseline, found_eyear_baseline = self.get_climo_yrs_from_ts(
+                        input_ts_loc, data_name)
 
-            #Update baseline case name:
-            data_name += f"_{syear_baseline}_{eyear_baseline}"
+                    #History file path isn't needed if user is running ADF directly on time series.
+                    #So make sure start and end year are specified:
+                    if syear_baseline is None:
+                        msg = f"\t WARNING: No given start year for {data_name}, "
+                        msg += f"using first found year: {found_syear_baseline}"
+                        print(msg)
+                        syear_baseline = found_syear_baseline
+                    if not found_syear_baseline <= syear_baseline <= found_eyear_baseline:
+                        msg = f"\t WARNING: Given start year '{syear_baseline}' is not in current "
+                        msg += f"dataset {data_name}, using first found year: {found_syear_baseline}"
+                        print(msg)
+                        syear_baseline = found_syear_baseline
+
+                    if eyear_baseline is None:
+                        msg = f"\t WARNING: No given end year for {data_name}, "
+                        msg += f"using last found year: {found_eyear_baseline}"
+                        print(msg)
+                        eyear_baseline = found_eyear_baseline
+                    if not found_syear_baseline <= eyear_baseline <= found_eyear_baseline:
+                        msg = f"\t WARNING: Given end year '{eyear_baseline}' is not in current "
+                        msg += f"dataset {data_name}, using last found year: {found_eyear_baseline}"
+                        print(msg)
+                        eyear_baseline = found_eyear_baseline
+                # End if
+
+                # Check if history file path exists:
+                elif baseline_hist_locs and any(baseline_hist_locs):
+                    #Check if user provided
+                    if not baseline_hist_str:
+                        baseline_hist_str = ['cam.h0a']
+                    else:
+                        #Make list if not already
+                        if not isinstance(baseline_hist_str, list):
+                            baseline_hist_str = [baseline_hist_str]
+                    #Initialize baseline history string list
+                    self.__base_hist_str = baseline_hist_str
+
+                    #Grab first possible hist string, just looking for years of run
+                    base_hist_str = baseline_hist_str[0]
+                    starting_location = Path(baseline_hist_locs)
+                    print(f"\tChecking history files in '{starting_location}'")
+
+                    #Check if the history file location exists
+                    if not starting_location.is_dir():
+                        msg = "Checking history file location:\n"
+                        msg += f"\tThere is no history file location: '{starting_location}'."
+                        self.debug_log(msg)
+                        emsg = f"{data_name} starting_location: History file location not found!\n"
+                        emsg += "\tTry checking the path 'cam_hist_loc' in 'diag_cam_baseline_climo' "
+                        emsg += "section in your config file is correct..."
+                        self.end_diag_fail(emsg)
+                    file_list = sorted(starting_location.glob("*" + base_hist_str + ".*.nc"))
+
+                    #Check if there are any history files
+                    if len(file_list) == 0:
+                        msg = "Checking history files:\n"
+                        msg += f"\tThere are no history files in '{starting_location}'."
+                        self.debug_log(msg)
+                        emsg = f"{data_name} starting_location {starting_location}: "
+                        emsg += f"No history files found for {base_hist_str}!\n"
+                        emsg += "\tTry checking the path 'cam_hist_loc' or the 'hist_str' "
+                        emsg += " in 'diag_cam_baseline_climo' "
+                        emsg += "section in your config file are correct..."
+                        self.end_diag_fail(emsg)
+
+                    # Partition string to find exactly where h-number is
+                    # This cuts the string before and after the `{hist_str}.` sub-string
+                    # so there will always be three parts:
+                    # before sub-string, sub-string, and after sub-string
+                    #Since the last part always includes the time range, grab that with last index (2)
+                    #NOTE: this is based off the current CAM file name structure in the form:
+                    #  $CASE.cam.h#.YYYY<other date info>.nc
+                    base_climo_yrs = [int(str(i).partition(f"{base_hist_str}.")[2][0:4]) for i in file_list]
+                    if not base_climo_yrs:
+                        msg = f"\t ERROR: No climo years found in {baseline_hist_locs}, "
+                        raise AdfError(msg)
+
+                    base_climo_yrs = sorted(np.unique(base_climo_yrs))
+
+                    base_found_syr = int(base_climo_yrs[0])
+                    base_found_eyr = int(base_climo_yrs[-1])
+
+                    #Check if start or end year is missing. If so then just assume it is the
+                    #start or end of the entire available model data.
+                    if syear_baseline is None:
+                        msg = f"\t WARNING: No given start year for {data_name}, "
+                        msg += f"using first found year: {base_found_syr}"
+                        print(msg)
+                        syear_baseline = base_found_syr
+                    if not base_found_syr <= syear_baseline <= base_found_eyr:
+                        msg = f"\t WARNING: Given start year '{syear_baseline}' is not in current "
+                        msg += f"dataset {data_name}, using first found year: {base_climo_yrs[0]}"
+                        print(msg)
+                        syear_baseline = base_found_syr
+
+                    if eyear_baseline is None:
+                        msg = f"\t WARNING: No given end year for {data_name}, "
+                        msg += f"using last found year: {base_found_eyr}"
+                        print(msg)
+                        eyear_baseline = base_found_eyr
+                    if not base_found_syr <= eyear_baseline <= base_found_eyr:
+                        msg = f"\t WARNING: Given end year '{eyear_baseline}' is not in current "
+                        msg += f"dataset {data_name}, using last found year: {base_climo_yrs[-1]}"
+                        print(msg)
+                        eyear_baseline = base_found_eyr
+
+                else:
+                    #Neither pre-made time series nor a history file location was provided,
+                    #so years can only come from explicit start_year/end_year config entries.
+                    if (syear_baseline is None) or (eyear_baseline is None):
+                        emsg = f"Unable to determine baseline years for '{data_name}'.\n"
+                        emsg += "\tProvide 'cam_ts_loc' (with 'cam_ts_done'), or 'cam_hist_loc', or "
+                        emsg += "explicit 'start_year' and 'end_year' in the 'diag_cam_baseline_climo' "
+                        emsg += "section of your config file."
+                        self.end_diag_fail(emsg)
+                #End if
+
+                #Grab baseline nickname
+                base_nickname = self.get_baseline_info('case_nickname')
+                if base_nickname is None:
+                    base_nickname = data_name
+
+                #Get integer for baseline years for searching climo files
+                syear_baseline = int(syear_baseline)
+                eyear_baseline = int(eyear_baseline)
+
+                #Update baseline case name:
+                data_name += f"_{syear_baseline}_{eyear_baseline}"
         #End if (compare_obs)
 
         #Initialize case nicknames:
         self.__test_nicknames = test_nicknames
         self.__base_nickname = base_nickname
 
-        #Save starting and ending years as object variables:
-        self.__syear_baseline = syear_baseline
-        self.__eyear_baseline = eyear_baseline
+        if not self.__inform_diags:
+            #Save starting and ending years as object variables:
+            self.__syear_baseline = syear_baseline
+            self.__eyear_baseline = eyear_baseline
 
         #Create plot location variable for potential use by the website generator.
         #Please note that this is also assumed to be the output location for the analyses scripts:
@@ -363,179 +386,238 @@ class AdfInfo(AdfConfig):
         #Case names:
         case_names = self.get_cam_info('cam_case_name', required=True)
 
-        #Start years (not currently required):
-        syears = self.get_cam_info('start_year')
+        if not self.__inform_diags:
+            #Start years (not currently required):
+            syears = self.get_cam_info('start_year')
 
-        #End year (not currently rquired):
-        eyears = self.get_cam_info('end_year')
+            #End year (not currently rquired):
+            eyears = self.get_cam_info('end_year')
 
-        #Make lists of None to be iterated over for case_names
-        if syears is None:
-            syears = [None] * self.__num_cases
-        elif not isinstance(syears, list):
-            syears = [syears] * self.__num_cases
+            #Make lists of None to be iterated over for case_names
+            if syears is None:
+                syears = [None]*len(case_names)
+            #End if
+            if eyears is None:
+                eyears = [None]*len(case_names)
+            #End if
 
-        if eyears is None:
-            eyears = [None] * self.__num_cases
-        elif not isinstance(eyears, list):
-            eyears = [eyears] * self.__num_cases
         #Extract cam history files location:
         cam_hist_locs = self.get_cam_info('cam_hist_loc')
 
         #Get cleaned nested list of hist_str for test case(s) (component.hist_num, eg cam.h0)
         cam_hist_str = self.__cam_climo_info.get('hist_str', None)
-
+        print("cam_hist_str",cam_hist_str,"\n")
         if not cam_hist_str:
-            hist_str = [['cam.h0a']]*self.__num_cases
+            hist_strs = [['cam.h0a']]*self.__num_cases
         else:
-            hist_str = cam_hist_str
+            hist_strs = []
+            for hs in cam_hist_str[0]:
+                if not isinstance(hs, list):
+                    ah = [hs]
+                else:
+                    ah = hs
+                hist_strs.append(ah)
         #End if
 
         #Initialize CAM history string nested list
-        self.__hist_str = hist_str
+        self.__hist_str = hist_strs
+        print("hist_strs",hist_strs,"\n")
 
         #Check if using pre-made ts files
         cam_ts_done   = self.get_cam_info("cam_ts_done")
+        if not cam_ts_done:
+            cam_ts_done = [False]*self.__num_cases
 
         #Grab case time series file location(s)
-        input_ts_locs = self.get_cam_info("cam_ts_loc", required=True)
+        input_ts_locs = self.get_cam_info("cam_ts_loc") #, required=True
+        if not input_ts_locs:
+            input_ts_locs = [None]*self.__num_cases
 
         #Loop over cases:
         syears_fixed = []
         eyears_fixed = []
         for case_idx, case_name in enumerate(case_names):
+            #print("\tANNOYING BUT HERE IT S THE CASE:,",case_name,"---------------------")
+            if self.__inform_diags:
+                #Check if history file path exists:
+                hist_str_case = hist_strs[case_idx]
+                if any(cam_hist_locs):
+                    #Grab first possible hist string, just looking for years of run
+                    hist_str = hist_str_case[0]
+                    print("hist_str",hist_str,"--->",case_name)
 
-            syear = syears[case_idx]
-            eyear = eyears[case_idx]
+                    #Get climo years for verification or assignment if missing
+                    starting_location = Path(cam_hist_locs[case_idx])
+                    print(f"\tChecking history files in '{starting_location}'")
 
-            #Check if time series files exist, if so don't rely on climo years
-            if cam_ts_done[case_idx]:
-                cam_hist_locs[case_idx] = None
+                    file_list = sorted(starting_location.glob('*'+hist_str+'.*.nc'))
 
-                #Grab case time series file location
-                input_ts_loc = Path(input_ts_locs[case_idx])
-                print(f"Checking existing time-series files in {input_ts_loc}")
+                    #Check if the history file location exists
+                    if not starting_location.is_dir():
+                        msg = "Checking history file location:\n"
+                        msg += f"\tThere is no history file location: '{starting_location}'."
+                        self.debug_log(msg)
+                        emsg = f"{case_name} starting_location: History file location not found!\n"
+                        emsg += "\tTry checking the path 'cam_hist_loc' in 'diag_cam_climo' "
+                        emsg += "section in your config file is correct..."
+                        #self.end_diag_fail(emsg)
+                        print(emsg)
+                        pass
 
-                #Get years from pre-made timeseries file(s)
-                found_syear, found_eyear = self.get_climo_yrs_from_ts(
-                    input_ts_loc, case_name, hist_str=self.__hist_str[case_idx])
+                    #Check if there are any history files
+                    file_list = sorted(starting_location.glob('*'+hist_str+'.*.nc'))
 
-                #History file path isn't needed if user is running ADF directly on time series.
-                #So make sure start and end year are specified:
-                if syear is None:
-                    msg = f"\t WARNING: No given start year for {case_name}, "
-                    msg += f"using first found year: {found_syear}"
-                    print(msg)
-                    syear = found_syear
-                if not found_syear <= syear <= found_eyear:
-                    msg = f"\t WARNING: Given start year '{syear}' is not in current dataset "
-                    msg += f"{case_name}, using first found year: {found_syear}\n"
-                    print(msg)
-                    syear = found_syear
+                    if len(file_list) == 0:
+                        msg = "Checking history files:\n"
+                        msg += f"\tThere are no history files in '{starting_location}'."
+                        self.debug_log(msg)
+                        emsg = f"{case_name} starting_location {starting_location}: "
+                        emsg += f"No history files found for {hist_str}!\n"
+                        emsg += "\tTry checking the path 'cam_hist_loc' or the 'hist_str' "
+                        emsg += "in 'diag_cam_climo' "
+                        emsg += "section in your config file are correct..."
+                        #self.end_diag_fail(emsg)
+                        print(emsg)
+                        pass
+                else:
+                    print("No good cases found, man this must be real bad news for the user.\n\tYou. It must stink to be you right now.")
+            else:
+                syear = syears[case_idx]
+                eyear = eyears[case_idx]
+
+                #Check if time series files exist, if so don't rely on climo years
+                if cam_ts_done[case_idx]:
+                    cam_hist_locs[case_idx] = None
+
+                    #Grab case time series file location
+                    input_ts_loc = Path(input_ts_locs[case_idx])
+                    print(f"Checking existing time-series files in {input_ts_loc}")
+
+                    #Get years from pre-made timeseries file(s)
+                    found_syear, found_eyear = self.get_climo_yrs_from_ts(input_ts_loc, case_name)
+
+                    #History file path isn't needed if user is running ADF directly on time series.
+                    #So make sure start and end year are specified:
+                    if syear is None:
+                        msg = f"\t WARNING: No given start year for {case_name}, "
+                        msg += f"using first found year: {found_syear}"
+                        print(msg)
+                        syear = found_syear
+                    if not found_syear <= syear <= found_eyear:
+                        msg = f"\t WARNING: Given start year '{syear}' is not in current dataset "
+                        msg += f"{case_name}, using first found year: {found_syear}\n"
+                        print(msg)
+                        syear = found_syear
+                    #End if
+                    if eyear is None:
+                        msg = f"\t WARNING: No given end year for {case_name}, "
+                        msg += f"using last found year: {found_eyear}"
+                        print(msg)
+                        eyear = found_eyear
+                    if not found_syear <= eyear <= found_eyear:
+                        msg = f"\t WARNING: Given end year '{eyear}' is not in current dataset "
+                        msg += f"{case_name}, using last found year: {found_eyear}\n"
+                        print(msg)
+                        eyear = found_eyear
+                    #End if
                 #End if
-                if eyear is None:
-                    msg = f"\t WARNING: No given end year for {case_name}, "
-                    msg += f"using last found year: {found_eyear}"
-                    print(msg)
-                    eyear = found_eyear
-                if not found_syear <= eyear <= found_eyear:
-                    msg = f"\t WARNING: Given end year '{eyear}' is not in current dataset "
-                    msg += f"{case_name}, using last found year: {found_eyear}\n"
-                    print(msg)
-                    eyear = found_eyear
+
+                #Check if history file path exists:
+                hist_str_case = hist_strs[case_idx]
+                if any(cam_hist_locs):
+                    #Grab first possible hist string, just looking for years of run
+                    hist_str = hist_str_case[0]
+
+                    #Get climo years for verification or assignment if missing
+                    starting_location = Path(cam_hist_locs[case_idx])
+                    print(f"\tChecking history files in '{starting_location}'")
+
+                    file_list = sorted(starting_location.glob('*'+hist_str+'.*.nc'))
+
+                    #Check if the history file location exists
+                    if not starting_location.is_dir():
+                        msg = "Checking history file location:\n"
+                        msg += f"\tThere is no history file location: '{starting_location}'."
+                        self.debug_log(msg)
+                        emsg = f"{case_name} starting_location: History file location not found!\n"
+                        emsg += "\tTry checking the path 'cam_hist_loc' in 'diag_cam_climo' "
+                        emsg += "section in your config file is correct..."
+                        self.end_diag_fail(emsg)
+
+                    #Check if there are any history files
+                    file_list = sorted(starting_location.glob('*'+hist_str+'.*.nc'))
+
+                    if len(file_list) == 0:
+                        msg = "Checking history files:\n"
+                        msg += f"\tThere are no history files in '{starting_location}'."
+                        self.debug_log(msg)
+                        emsg = f"{case_name} starting_location {starting_location}: "
+                        emsg += f"No history files found for {hist_str}!\n"
+                        emsg += "\tTry checking the path 'cam_hist_loc' or the 'hist_str' "
+                        emsg += "in 'diag_cam_climo' "
+                        emsg += "section in your config file are correct..."
+                        self.end_diag_fail(emsg)
+
+                    #Partition string to find exactly where h-number is
+                    #This cuts the string before and after the `{hist_str}.` sub-string
+                    # so there will always be three parts:
+                    # before sub-string, sub-string, and after sub-string
+                    #Since the last part always includes the time range, grab that with last index (2)
+                    #NOTE: this is based off the current CAM file name structure in the form:
+                    #  $CASE.cam.h#.YYYY<other date info>.nc
+                    case_climo_yrs = [int(str(i).partition(f"{hist_str}.")[2][0:4]) for i in file_list]
+                    if not case_climo_yrs:
+                        msg = f"\t ERROR: No climo years found in {cam_hist_locs[case_idx]}, "
+                        raise AdfError(msg)
+                    case_climo_yrs = sorted(np.unique(case_climo_yrs))
+
+                    case_found_syr = int(case_climo_yrs[0])
+                    case_found_eyr = int(case_climo_yrs[-1])
+
+                    #Check if start or end year is missing.  If so then just assume it is the
+                    #start or end of the entire available model data.
+                    if syear is None:
+                        msg = f"\t WARNING: No given start year for {case_name}, "
+                        msg += f"using first found year: {case_found_syr}"
+                        print(msg)
+                        syear = case_found_syr
+                    if not case_found_syr <= syear <= case_found_eyr:
+                        msg = f"\t WARNING: Given start year '{syear}' is not in current dataset "
+                        msg += f"{case_name}, using first found year: {case_climo_yrs[0]}\n"
+                        print(msg)
+                        syear = case_found_syr
+                    #End if
+                    if eyear is None:
+                        msg = f"\t WARNING: No given end year for {case_name}, "
+                        msg += f"using last found year: {case_found_eyr}"
+                        print(msg)
+                        eyear = case_found_eyr
+                    if not case_found_syr <= eyear <= case_found_eyr:
+                        msg = f"\t WARNING: Given end year '{eyear}' is not in current dataset "
+                        msg += f"{case_name}, using last found year: {case_climo_yrs[-1]}\n"
+                        print(msg)
+                        eyear = case_found_eyr
+                    #End if
                 #End if
-            #End if
 
-            #Check if history file path exists:
-            hist_str_case = hist_str[case_idx]
-            if any(cam_hist_locs):
-                #Grab first possible hist string, just looking for years of run
-                hist_str_use = hist_str_case[0]
+                #Update climo year lists in case anything changed
+                syear = int(syear)
+                eyear = int(eyear)
+                syears_fixed.append(syear)
+                eyears_fixed.append(eyear)
 
-                #Get climo years for verification or assignment if missing
-                starting_location = Path(cam_hist_locs[case_idx])
-                print(f"\tChecking history files in '{starting_location}'")
-
-                file_list = sorted(starting_location.glob('*'+hist_str_use+'.*.nc'))
-
-                #Check if the history file location exists
-                if not starting_location.is_dir():
-                    msg = "Checking history file location:\n"
-                    msg += f"\tThere is no history file location: '{starting_location}'."
-                    self.debug_log(msg)
-                    emsg = f"{case_name} starting_location: History file location not found!\n"
-                    emsg += "\tTry checking the path 'cam_hist_loc' in 'diag_cam_climo' "
-                    emsg += "section in your config file is correct..."
-                    self.end_diag_fail(emsg)
-
-                #Check if there are any history files
-                file_list = sorted(starting_location.glob('*'+hist_str_use+'.*.nc'))
-                if len(file_list) == 0:
-                    msg = "Checking history files:\n"
-                    msg += f"\tThere are no history files in '{starting_location}'."
-                    self.debug_log(msg)
-                    emsg = f"{case_name} starting_location {starting_location}: "
-                    emsg += f"No history files found for {hist_str}!\n"
-                    emsg += "\tTry checking the path 'cam_hist_loc' or the 'hist_str' "
-                    emsg += "in 'diag_cam_climo' "
-                    emsg += "section in your config file are correct..."
-                    self.end_diag_fail(emsg)
-
-                #Partition string to find exactly where h-number is
-                #This cuts the string before and after the `{hist_str}.` sub-string
-                # so there will always be three parts:
-                # before sub-string, sub-string, and after sub-string
-                #Since the last part always includes the time range, grab that with last index (2)
-                #NOTE: this is based off the current CAM file name structure in the form:
-                #  $CASE.cam.h#.YYYY<other date info>.nc
-                case_climo_yrs = [int(str(i).partition(f"{hist_str_use}.")[2][0:4]) for i in file_list]
-                if not case_climo_yrs:
-                    msg = f"\t ERROR: No climo years found in {cam_hist_locs[case_idx]}, "
-                    raise AdfError(msg)
-                case_climo_yrs = sorted(np.unique(case_climo_yrs))
-
-                case_found_syr = int(case_climo_yrs[0])
-                case_found_eyr = int(case_climo_yrs[-1])
-
-                #Check if start or end year is missing.  If so then just assume it is the
-                #start or end of the entire available model data.
-                if syear is None:
-                    msg = f"\t WARNING: No given start year for {case_name}, "
-                    msg += f"using first found year: {case_found_syr}"
-                    print(msg)
-                    syear = case_found_syr
-                if not case_found_syr <= syear <= case_found_eyr:
-                    msg = f"\t WARNING: Given start year '{syear}' is not in current dataset "
-                    msg += f"{case_name}, using first found year: {case_climo_yrs[0]}\n"
-                    print(msg)
-                    syear = case_found_syr
-                #End if
-                if eyear is None:
-                    msg = f"\t WARNING: No given end year for {case_name}, "
-                    msg += f"using last found year: {case_found_eyr}"
-                    print(msg)
-                    eyear = case_found_eyr
-                if not case_found_syr <= eyear <= case_found_eyr:
-                    msg = f"\t WARNING: Given end year '{eyear}' is not in current dataset "
-                    msg += f"{case_name}, using last found year: {case_climo_yrs[-1]}\n"
-                    print(msg)
-                    eyear = case_found_eyr
-                #End if
-            #End if
-
-            #Update climo year lists in case anything changed
-            syear = int(syear)
-            eyear = int(eyear)
-            syears_fixed.append(syear)
-            eyears_fixed.append(eyear)
-
-            #Update case name with provided/found years:
-            case_name += f"_{syear}_{eyear}"
+                #Update case name with provided/found years:
+                case_name += f"_{syear}_{eyear}"
 
             #Set the final directory name and save it to plot_location:
-            direc_name = f"{case_name}_vs_{data_name}"
-            plot_loc = os.path.join(plot_dir, direc_name)
-            self.__plot_location.append(plot_loc)
+            if not self.__inform_diags:
+                direc_name = f"{case_name}_vs_{data_name}"
+                plot_loc = os.path.join(plot_dir, direc_name)
+                self.__plot_location.append(plot_loc)
+            else:
+                direc_name = "inform_diags"
+                plot_loc = plot_dir
+                self.__plot_location = plot_loc
 
             #If first iteration, then save directory name for use by baseline:
             first_case_dir = ''
@@ -551,8 +633,9 @@ class AdfInfo(AdfConfig):
                 diag_location.mkdir(parents=True)
         #End for
 
-        self.__syears = syears_fixed
-        self.__eyears = eyears_fixed
+        if not self.__inform_diags:
+            self.__syears = syears_fixed
+            self.__eyears = eyears_fixed
 
         #Finally add baseline case (if applicable) for use by the website table
         #generator.  These files will be stored in the same location as the first
@@ -657,6 +740,12 @@ class AdfInfo(AdfConfig):
     def user(self):
         """Return the "user" name if requested."""
         return self.__user
+    
+    # Create property needed to return "inform_diags" logical to user:
+    @property
+    def inform_diags(self):
+        """Return the "inform_diags" logical to the user if requested."""
+        return self.__inform_diags
 
     # Create property needed to return "compare_obs" logical to user:
     @property
@@ -677,6 +766,15 @@ class AdfInfo(AdfConfig):
         #Note that a copy is needed in order to avoid having a script mistakenly
         #modify this variable, as it is mutable and thus passed by reference:
         return copy.copy(self.__diag_var_list)
+    
+    # Create property needed to return "config_file" list to user:
+    @property
+    def config_file_dict(self):
+        """Return the "config_file_dict" dict to the user if requested."""
+        self.__config_file_dict = {"file_path":self.__config_file,
+                                   "file_name":Path(self.__config_file).name,
+                                   "name":Path(self.__config_file).stem}
+        return self.__config_file_dict
 
     # Create property needed to return "basic_info" expanded dictionary to user:
     @property
@@ -747,6 +845,33 @@ class AdfInfo(AdfConfig):
             base_hist_strs = ""
         hist_strs = {"test_hist_str":cam_hist_strs, "base_hist_str":base_hist_strs}
         return hist_strs
+    
+
+    @property
+    def campaigns_dict(self):
+        """Return a copy of the "campaigns_dict" list to the user if requested."""
+        #Note that a copy is needed in order to avoid having a script mistakenly
+        #modify this variable, as it is mutable and thus passed by reference:
+        return copy.copy(self.__campaigns)
+    
+    from contextlib import contextmanager
+
+    
+    '''
+    @property
+    def satellite_dict(self):
+        """Return a copy of the "satellite_dict" list to the user if requested."""
+        #Note that a copy is needed in order to avoid having a script mistakenly
+        #modify this variable, as it is mutable and thus passed by reference:
+        return copy.copy(self.__satellites)
+    
+    @property
+    def model_dict(self):
+        """Return a copy of the "models_dict" list to the user if requested."""
+        #Note that a copy is needed in order to avoid having a script mistakenly
+        #modify this variable, as it is mutable and thus passed by reference:
+        return copy.copy(self.__models)
+    '''
 
 
     #########
@@ -848,21 +973,10 @@ class AdfInfo(AdfConfig):
     #########
 
     # Utility function to grab climo years from pre-made time series files:
-    def get_climo_yrs_from_ts(self, input_ts_loc, case_name, hist_str=None):
+    def get_climo_yrs_from_ts(self, input_ts_loc, case_name):
         """
         Grab start and end climo years if none are specified in config file
         for pre-made time series file(s)
-
-        Parameters
-        ----------
-        input_ts_loc
-            directory holding the pre-made time series files
-        case_name
-            name of the case whose files should be searched for
-        hist_str : str or list, optional
-            history stream(s) configured for this case.  When given, the
-            stream is used in the search; when absent the older, looser
-            "any h0 stream" search is used instead.
 
         Return
         ------
@@ -881,71 +995,17 @@ class AdfInfo(AdfConfig):
             errmsg = f"\t ERROR: Time series directory '{input_ts_loc}' not found.  Script is exiting."
             raise AdfError(errmsg)
 
-        #Normalize the configured history stream(s) into a list:
-        if not hist_str:
-            hist_strs = []
-        elif isinstance(hist_str, str):
-            hist_strs = [hist_str]
-        else:
-            hist_strs = [h for h in hist_str if h]
-        #End if
-
         # Search for first available variable in var_list to get a time series file to read
         # NOTE: it is assumed all the variables have the same dates!
-        # Try the configured stream(s) first, then the older, looser search
-        # (any h0 stream) so pre-existing directories still work:
-        def ts_patterns(var):
-            """Search patterns for one variable, most specific first."""
-            return ([f"{case_name}.{hstr}.{var}.*nc" for hstr in hist_strs]
-                    + [f"{case_name}*h0*.{var}.*nc"])
-        #End def
-
-        #Sweep by pattern rank rather than by variable: every variable is tried
-        #against the configured stream before any variable is tried against the
-        #looser fallback, so a stray file from another stream cannot outrank
-        #the stream the user actually configured.  Within a rank, the flat
-        #search comes first for every variable and the recursive one only
-        #afterwards -- a missing variable is normal, and recursing per pattern
-        #would walk the whole tree once for every pattern tried.
-        n_ranks = len(hist_strs) + 1
-        ts_files = []
-        skipped = var_list
-        for rank in range(n_ranks):
-            for recursive in (False, True):
-                for idx, var in enumerate(var_list):
-                    ts_files = utils.find_ts_files(input_location,
-                                                   ts_patterns(var)[rank],
-                                                   recursive=recursive)
-                    if ts_files:
-                        #Everything ahead of it was tried and missed:
-                        skipped = var_list[:idx]
-                        break
-                    #End if
-                #End for
-                if ts_files:
-                    break
-                #End if
-            #End for
+        # Also, it is assumed that only h0 files should be climo-ed.
+        for var in var_list:
+            ts_files = sorted(input_location.glob(f"{case_name}*h0*.{var}.*nc"))
             if ts_files:
                 break
-            #End if
-        #End for
-
-        #Report only the variables that were genuinely passed over.  Logging
-        #inside the sweep would name every variable in diag_var_list whenever
-        #the files turned out to be in a nested layout, which is not a problem
-        #and not worth dozens of lines of debug log.
-        for var in skipped:
-            logmsg = "get years for time series:"
-            logmsg += f"\n\tVar '{var}' not in dataset, skip to next to try and find climo years..."
-            self.debug_log(logmsg)
-        #End for
-
-        if not ts_files:
-            errmsg = f"\t ERROR: No time series files found in '{input_ts_loc}' for case "
-            errmsg += f"'{case_name}' for any variable in 'diag_var_list'.  Script is exiting."
-            raise AdfError(errmsg)
-        #End if
+            else:
+                logmsg = "get years for time series:"
+                logmsg += f"\n\tVar '{var}' not in dataset, skip to next to try and find climo years..."
+                self.debug_log(logmsg)
 
         #Read in file(s)
         if len(ts_files) == 1:

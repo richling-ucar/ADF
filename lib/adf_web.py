@@ -64,7 +64,11 @@ class _WebData:
                  data_frame = False,
                  html_file  = None,
                  asset_path = None,
-                 multi_case = False):
+                 multi_case = False,
+                 cam_desc = "",
+                 plot_loc = ".",
+                 panel = None,
+                 panel_label = None):
 
         #Initialize relevant website variables:
         self.name       = web_name
@@ -78,6 +82,10 @@ class _WebData:
         self.html_file  = html_file
         self.asset_path = asset_path
         self.multi_case = multi_case
+        self.plot_loc   = plot_loc
+        self.cam_desc   = cam_desc
+        self.panel       = panel
+        self.panel_label = panel_label
 
 #+++++++++++++++++++++
 #Define main web class
@@ -111,6 +119,11 @@ class AdfWeb(AdfObs):
         self.__plot_type_multi = []
 
         #Initialize website plot type
+
+        """plot_path = Path(self.plot_location)
+        website_dir = plot_path / "website"
+        print("plot_path",plot_path,"\nwebsite_dir",website_dir)
+        Path(website_dir).mkdir(parents=True, exist_ok=True)"""
 
         #Set case website path dictionary:
         #--------------------------------
@@ -188,7 +201,15 @@ class AdfWeb(AdfObs):
         if not active_env:
             active_env = "--"
 
-        run_info = ''
+        if self.inform_diags:
+            plot_path = Path(self.plot_location)
+        else:
+            plot_path = Path(self.plot_location[0])
+
+        #Create directory path where the website will be built:
+        website_dir = plot_path / "website"
+        Path(website_dir).mkdir(parents=True, exist_ok=True)
+        run_info = ""
         if self.debug_log:
             log_name = self.debug_fname
             run_info = f"{log_name}".replace("debug","run_info").replace(".log",".md")
@@ -317,7 +338,11 @@ class AdfWeb(AdfObs):
                          season = None,
                          non_season = False,
                          plot_type = "Special",
-                         multi_case=False):
+                         multi_case=False,
+                         cam_desc="",
+                         plot_loc=".",
+                         panel=None,
+                         panel_label=None):
 
         """
         Method that provides scripts a way to add an image file or
@@ -345,6 +370,13 @@ class AdfWeb(AdfObs):
         multi_case -> Logical which indicates whether the image or dataframe can contain
                       multiple cases (e.g. a line plot with one line for each case).
 
+        panel       -> Optional machine key distinguishing a multi-panel "summary" image
+                      from its individual component panels within the same (campaign, case,
+                      plot_type), e.g. "summary", "open_cell", "open_cell_bias". Leave as
+                      None for plot types that don't have this structure.
+
+        panel_label -> Optional human-readable label for "panel", e.g. "Open-Cell Bias".
+
         """
 
         #Do nothing if user is not requesting a website to be generated:
@@ -369,6 +401,22 @@ class AdfWeb(AdfObs):
                 print(wmsg)
                 return
             #End if
+
+            #Initialize web data object:
+            if self.inform_diags:
+                web_data = _WebData(web_data, web_name, case_name,
+                                category = category,
+                                plot_type = plot_type,
+                                plot_loc = plot_loc,
+                                cam_desc = cam_desc,
+                                panel = panel,
+                                panel_label = panel_label,
+                                )
+
+                #Add web data object to list:
+                self.__website_data.append(web_data)
+
+                return
 
         except TypeError:
             bad_input = False
@@ -465,6 +513,168 @@ class AdfWeb(AdfObs):
             emsg += "\nPlease install module, e.g. 'pip install Jinja2'"
             self.end_diag_fail(emsg)
         #End except
+
+        if self.inform_diags:
+
+            import json
+            from pathlib import Path
+
+            """manifest = []
+
+            for web_data in self.__website_data:
+                print(f"OH BOY BIG? {dir(web_data)}")
+
+                print(f"campaign: {web_data.case}\ncase: {web_data.cam_desc}\nplot: {web_data.plot_type}\nurl {str(web_data.data.parts[-1])}") #\nurl: {web_data.web_data}
+                manifest.append({
+                    "urls": str(web_data.data.parts[-1]),
+                    "case": web_data.cam_desc,
+                    "campaign": web_data.case,
+                    "label": web_data.plot_type,
+                })"""
+            
+            plot_path = Path(self.plot_location)
+
+            #Create directory path where the website will be built:
+            website_dir = plot_path / "website"
+            assets_dir = website_dir / "assets"
+            assets_dir.mkdir(exist_ok=True)
+
+            manifest_dict = {}
+
+            for web_data in self.__website_data:
+
+                campaign = web_data.case
+                case = web_data.cam_desc
+                print(".   web INFORM CASE",case)
+                url = Path("assets") / str(web_data.data.parts[-1])
+
+                key = (campaign, case)
+
+                if key not in manifest_dict:
+
+                    manifest_dict[key] = {
+                        "campaign": campaign,
+                        "case": case,
+                        "urls": [],
+                    }
+
+                url_entry = {"url":str(url), "type":web_data.plot_type, "category":web_data.category}
+
+                #Only add panel/panel_label for plot types that actually use them
+                #(e.g. a multi-panel "summary" image plus its individual component
+                #panels), so other plot types' JSON is unaffected:
+                if web_data.panel is not None:
+                    url_entry["panel"] = web_data.panel
+                if web_data.panel_label is not None:
+                    url_entry["panel_label"] = web_data.panel_label
+
+                manifest_dict[key]["urls"].append(url_entry)
+
+            manifest = list(manifest_dict.values())
+
+            config_file_name = self.config_file_dict["name"]
+            current_man = f"manifest_{config_file_name}.json"
+
+            #Determine local directory:
+            adf_lib_dir = Path(__file__).parent
+
+            #Set path to Jinja2 template files:
+            jinja_template_dir = Path(adf_lib_dir, 'website_templates')
+
+            print("manifest",manifest)
+            #with open(jinja_template_dir / "manifest.json", "w") as f:
+            #    json.dump(manifest, f, indent=2)
+
+            # Build out INFORM D3 web data plot pages and Dashboard
+            #------------------------------------------------------
+            # Build one Dropsonde + one Nd-LWC PDF + one Sensitivity vs
+            # Sigma W interactive page PER CAMPAIGN, matching
+            # cam_obs_dropsonde_comp.py/cam_obs_nd_lwc_pdf.py/
+            # sensitivity_vs_sigmaw_2x2_obs_cam.py's per-campaign JSON naming
+            # (dropsonde_profiles_{campaign}_{config}.json,
+            # nd_lwc_pdfs_{campaign}_{config}.json,
+            # sensitivity_vs_sigmaw_{campaign}_{config}.json). The dashboard's
+            # Interactive Plots tab discovers these dynamically from the
+            # manifest's "campaign" values, so no further wiring is needed
+            # here beyond writing one page per campaign.
+            with open(jinja_template_dir / 'template_dropsonde.html', 'r', encoding='utf-8') as file:
+                dropsonde_template = file.read()
+            with open(jinja_template_dir / 'template_nd_lwc_pdf.html', 'r', encoding='utf-8') as file:
+                nd_lwc_pdf_template = file.read()
+            with open(jinja_template_dir / 'template_sensitivity_vs_sigmaw.html', 'r', encoding='utf-8') as file:
+                sensitivity_template = file.read()
+
+            for campaign_name in self.campaigns_dict["name"]:
+                current_json = f"dropsonde_profiles_{campaign_name}_{config_file_name}.json"
+                updated_dropsonde_content = dropsonde_template.replace('sample_dropsonde_profile.json', current_json)
+                with open(website_dir / f'dropsonde_{campaign_name}.html', 'w', encoding='utf-8') as file:
+                    file.write(updated_dropsonde_content)
+
+                current_json = f"nd_lwc_pdfs_{campaign_name}_{config_file_name}.json"
+                updated_nd_lwc_pdf_content = nd_lwc_pdf_template.replace('sample_nd_lwc_pdf.json', current_json)
+                with open(website_dir / f'nd_lwc_pdf_{campaign_name}.html', 'w', encoding='utf-8') as file:
+                    file.write(updated_nd_lwc_pdf_content)
+
+                current_json = f"sensitivity_vs_sigmaw_{campaign_name}_{config_file_name}.json"
+                updated_sensitivity_content = sensitivity_template.replace('sample_sensitivity_vs_sigmaw.json', current_json)
+                with open(website_dir / f'sensitivity_vs_sigmaw_{campaign_name}.html', 'w', encoding='utf-8') as file:
+                    file.write(updated_sensitivity_content)
+
+            #------------------------------
+
+            #Build out Dashboard
+            with open(jinja_template_dir / 'dashboard.js', 'r', encoding='utf-8') as file:
+                js_content = file.read()
+
+            #Update to actual json file
+            updated_content = js_content.replace('manifest.json', current_man)
+            with open(website_dir / 'dashboard.js', 'w', encoding='utf-8') as file:
+                file.write(updated_content)
+
+            shutil.copyfile(jinja_template_dir / "dashboard.html", website_dir / "dashboard.html")
+            shutil.copyfile(jinja_template_dir / "dashboard.css", website_dir / "dashboard.css")
+            #shutil.copyfile(jinja_template_dir / current_man, website_dir / current_man)
+            with open(str(website_dir / current_man), "w") as f:
+                json.dump(manifest, f, indent=2)
+
+            """#Determine local directory:
+            adf_lib_dir = Path(__file__).parent
+
+            #Set path to Jinja2 template files:
+            jinja_template_dir = Path(adf_lib_dir, 'website_templates')"""
+
+            #Create the jinja Environment object:
+            env = jinja2.Environment(
+                loader=jinja2.FileSystemLoader(jinja_template_dir)
+            )
+
+            template = env.get_template("template_inform_index.html")
+
+            html = template.render(
+                manifest=manifest
+            )
+
+            with open("inform_index.html", "w") as f:
+                f.write(html)
+
+            #Move file to assets directory:
+            assets_dir = website_dir / "assets"
+            assets_dir.mkdir(exist_ok=True)
+            # Copy every campaign's plot PNGs (named "{campaign}__...") into
+            # assets/, driven by the configured campaign list
+            for campaign_name in self.campaigns_dict["name"]:
+                campaign_imgs = sorted(plot_path.glob(f"{campaign_name}*"))
+                for file_path in campaign_imgs:
+                    # Check if the file actually exists before trying to copy it
+                    if os.path.exists(file_path):
+                        # shutil.copy will copy the file into the destination folder
+                        shutil.copy(file_path, assets_dir)
+                    else:
+                        print(f"Warning: File not found, skipping: {file_path}")
+
+            #Notify user that script has finishedd:
+            print("  ...INFORM webpages have been generated successfully.")
+            return
 
         #Make jinja functions that mimics python functions.
         #  - This will allow for the use of 'list' in the html rendering.
@@ -852,6 +1062,7 @@ class AdfWeb(AdfObs):
             #Note: this is a copy, as the list is appended to below and
             #"res" is re-used on every pass through this loop:
             avail_plot_types = list(res["default_ptypes"])
+            avail_plot_types = res["default_ptypes"]
 
             #Check if current plot type is in ADF default.
             #If not, add it so the index.html file can include it
