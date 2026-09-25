@@ -34,7 +34,7 @@ def load_cam_files(cam_dir, file_sel, tmin, tmax, campaign):
         return pd.Timestamp(year=y, month=mo, day=d, hour=hh, minute=mm, second=ss)
     
     all_files = sorted([p for p in cam_dir.glob("*.nc") if f"{file_sel}" in p.name])
-    #print("all_files",all_files)
+
     times = []
     files = []
     for p in all_files:
@@ -49,8 +49,7 @@ def load_cam_files(cam_dir, file_sel, tmin, tmax, campaign):
     
     i0 = bisect.bisect_left(times, lo)
     i1 = bisect.bisect_right(times, hi) - 1
-    #print(f"uh? {i0 > i1 }")
-    #print("files",files)
+
     if i0 > i1 or not files:
         raise RuntimeError("No files found overlapping the requested time window.")
     
@@ -876,25 +875,29 @@ def subset_cam_by_campaign(
     # Build masks from ccfs set
     M = _getv(ds_ccfs_aln, "M")
     camp = campaign.strip().upper()
-    if Path(f"{nc_savepath}/{campaign}_CAM_microphys_mask_strat_composite.nc").is_file():
-        mask_strat = xr.open_dataset(f"{nc_savepath}/{campaign}_CAM_microphys_mask_strat_composite.nc")
-    if Path(f"{nc_savepath}/{campaign}_CAM_microphys_mask_open_composite.nc").is_file():
-        mask_open = xr.open_dataset(f"{nc_savepath}/{campaign}_CAM_microphys_mask_open_composite.nc")
+    #if Path(f"{nc_savepath}/{campaign}_CAM_microphys_mask_strat_composite.nc").is_file():
+    #    mask_strat = xr.open_dataset(f"{nc_savepath}/{campaign}_CAM_microphys_mask_strat_composite.nc")
+    #if Path(f"{nc_savepath}/{campaign}_CAM_microphys_mask_open_composite.nc").is_file():
+    #    mask_open = xr.open_dataset(f"{nc_savepath}/{campaign}_CAM_microphys_mask_open_composite.nc")
     if camp == "CSET":
         SST  = _getv(ds_ccfs_aln, "SST")
         Tadv = _getv(ds_ccfs_aln, "Tadv")
-        if not Path(f"{nc_savepath}/{campaign}_CAM_microphys_mask_strat_composite.nc").is_file():
-            mask_strat = ((M < -10) & (SST < 295)) | ((M < -11) & (Tadv < 0)).astype(bool)
-        if not Path(f"{nc_savepath}/{campaign}_CAM_microphys_mask_open_composite.nc").is_file():
-            mask_open  = ((M >= -10) & (SST >= 296)) | ((M >= -10) & (Tadv >= -4)).astype(bool)
+        mask_strat = ((M < -10) & (SST < 295)) | ((M < -11) & (Tadv < 0)).astype(bool)
+        mask_open  = ((M >= -10) & (SST >= 296)) | ((M >= -10) & (Tadv >= -4)).astype(bool)
+        #if not Path(f"{nc_savepath}/{campaign}_CAM_microphys_mask_strat_composite.nc").is_file():
+        #    mask_strat = ((M < -10) & (SST < 295)) | ((M < -11) & (Tadv < 0)).astype(bool)
+        #if not Path(f"{nc_savepath}/{campaign}_CAM_microphys_mask_open_composite.nc").is_file():
+        #    mask_open  = ((M >= -10) & (SST >= 296)) | ((M >= -10) & (Tadv >= -4)).astype(bool)
     elif camp == "SOCRATES":
         WS     = _getv(ds_ccfs_aln, "WS")
         EIS    = _getv(ds_ccfs_aln, "EIS")
         WSHEAR = _getv(ds_ccfs_aln, "wshear")
-        if not Path(f"{nc_savepath}/{campaign}_CAM_microphys_mask_strat_composite.nc").is_file():
-            mask_strat = ((M < -9)  & (WS < 9)) | ((M < -10) & (EIS > 7)) | ((M < -10) & (WSHEAR < 9)).astype(bool)
-        if not Path(f"{nc_savepath}/{campaign}_CAM_microphys_mask_open_composite.nc").is_file():
-            mask_open  = ((M >= -7) & (WS >= 9)) | ((M >= -8) & (EIS < 9)) | ((M >= -8) & (WSHEAR > 6)).astype(bool)
+        mask_strat = ((M < -9)  & (WS < 9)) | ((M < -10) & (EIS > 7)) | ((M < -10) & (WSHEAR < 9)).astype(bool)
+        mask_open  = ((M >= -7) & (WS >= 9)) | ((M >= -8) & (EIS < 9)) | ((M >= -8) & (WSHEAR > 6)).astype(bool)
+        #if not Path(f"{nc_savepath}/{campaign}_CAM_microphys_mask_strat_composite.nc").is_file():
+        #    mask_strat = ((M < -9)  & (WS < 9)) | ((M < -10) & (EIS > 7)) | ((M < -10) & (WSHEAR < 9)).astype(bool)
+        #if not Path(f"{nc_savepath}/{campaign}_CAM_microphys_mask_open_composite.nc").is_file():
+        #    mask_open  = ((M >= -7) & (WS >= 9)) | ((M >= -8) & (EIS < 9)) | ((M >= -8) & (WSHEAR > 6)).astype(bool)
     else:
         raise ValueError("campaign must be 'CSET' or 'SOCRATES'.")
 
@@ -903,16 +906,20 @@ def subset_cam_by_campaign(
         # ✅ compute masks fully before dropping to avoid boolean dask indexing
         ms = mask_strat.compute()
         mo = mask_open.compute()
-        if not Path(f"{nc_savepath}/{campaign}_CAM_microphys_strat_composite.nc").is_file():
-            ds_strat = ds_vars.where(ms, drop=True)
-        if not Path(f"{nc_savepath}/{campaign}_CAM_microphys_open_composite.nc").is_file():
-            ds_open  = ds_vars.where(mo, drop=True)
+        ds_strat = ds_vars.where(ms, drop=True)
+        ds_open  = ds_vars.where(mo, drop=True)
+        #if not Path(f"{nc_savepath}/{campaign}_CAM_microphys_strat_composite.nc").is_file():
+        #    ds_strat = ds_vars.where(ms, drop=True)
+        #if not Path(f"{nc_savepath}/{campaign}_CAM_microphys_open_composite.nc").is_file():
+        #    ds_open  = ds_vars.where(mo, drop=True)
     else:
         # keep lazily with NaNs (no boolean indexing)
-        if not Path(f"{nc_savepath}/{campaign}_CAM_microphys_strat_composite.nc").is_file():
-            ds_strat = ds_vars.where(mask_strat)
-        if not Path(f"{nc_savepath}/{campaign}_CAM_microphys_open_composite.nc").is_file():
-            ds_open  = ds_vars.where(mask_open)
+        ds_strat = ds_vars.where(mask_strat)
+        ds_open  = ds_vars.where(mask_open)
+        #if not Path(f"{nc_savepath}/{campaign}_CAM_microphys_strat_composite.nc").is_file():
+        #    ds_strat = ds_vars.where(mask_strat)
+        #if not Path(f"{nc_savepath}/{campaign}_CAM_microphys_open_composite.nc").is_file():
+        #    ds_open  = ds_vars.where(mask_open)
     """
     if not Path(f"{nc_savepath}/{campaign}_CAM_microphys_strat_composite.nc").is_file():
         ds_strat.to_netcdf(f"{nc_savepath}/{campaign}_CAM_microphys_strat_composite.nc")
