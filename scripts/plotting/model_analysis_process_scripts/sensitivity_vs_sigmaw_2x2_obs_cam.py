@@ -166,15 +166,38 @@ def compute_case_sensitivity_stats(case, ds_cam_comp, cam_Nd_var, cam_CCN_var, c
     return cam_out
 
 
-#cloud regimes
-def sensitivity_vs_sigmaw_2x2_obs_cam(adf, All_rf_df, ds_cams, campaign):
-    # Example usage of the microphysics processes plotting function
-    # Adjust the variable names and datasets as needed
+# Settings shared by the sensitivity and the alpha-vs-sigma_w regime
+# comparison diagnostics, which both draw from the one cache below.
+COMPUTE_KWARGS = dict(
+    Nd_col="CONCD_RWIO",
+    lwc_col="PLWCD_RWIO",
+    CCN_col="Nccn_UH_CVIU",
+    sigmaw_col="Sigma_w",
+    regime_col="cloud_regime",
+    Ndriz_col="Ndriz_2DC",
+    drizzle_threshold=0.0,
+    cam_temp_threshold_K=268.15,
+    cam_Nd_var="cam_Nc",
+    cam_CCN_var="cam_N_UHSAS",
+    cam_sigmaw_var="sigma_w",
+    cam_rain_var="cam_Nr",
+    cam_rain_threshold=0.0,
+    cam_regime_map={"Stratocumulus":"strat", "Open-Cell":"open"},
+    n_bins=10,
+    min_n=50,
+    binning="quantile",
+)
 
-    #Notify user that script has started:
-    msg = "\n  Generating CAM-Obs Sigma w sensitivity plots..."
-    print(f"{msg}\n  {'-' * (len(msg)-3)}")
 
+def load_sensitivity_sources(adf, All_rf_df, ds_cams, campaign):
+    """
+    Return the per-source sensitivity tables, {"Obs": df, <case>: df, ...},
+    from the pickle cache, computing (and caching) only what is missing.
+
+    `ds_cams` is only indexed for cases not already cached, so with a warm
+    cache no CAM data is read; likewise `All_rf_df` is only used when "Obs"
+    is missing.
+    """
     plot_loc = Path(adf.plot_location)
     yup = Path(adf.config_file_dict["name"])
     # pkl cache and JSON exports live alongside the dashboard/html files
@@ -186,30 +209,11 @@ def sensitivity_vs_sigmaw_2x2_obs_cam(adf, All_rf_df, ds_cams, campaign):
     # with, or get mistaken for already-cached, the first's:
     data_pkl = website_dir / f"sensitivity_vs_sigmaw_{campaign}_{yup}.pkl"
 
-    compute_kwargs = dict(
-        Nd_col="CONCD_RWIO",
-        lwc_col="PLWCD_RWIO",
-        CCN_col="Nccn_UH_CVIU",
-        sigmaw_col="Sigma_w",
-        regime_col="cloud_regime",
-        Ndriz_col="Ndriz_2DC",
-        drizzle_threshold=0.0,
-        cam_temp_threshold_K=268.15,
-        cam_Nd_var="cam_Nc",
-        cam_CCN_var="cam_N_UHSAS",
-        cam_sigmaw_var="sigma_w",
-        cam_rain_var="cam_Nr",
-        cam_rain_threshold=0.0,
-        cam_regime_map={"Stratocumulus":"strat", "Open-Cell":"open"},
-        n_bins=10,
-        min_n=50,
-        binning="quantile",
-    )
-    obs_kwargs = {k: compute_kwargs[k] for k in (
+    obs_kwargs = {k: COMPUTE_KWARGS[k] for k in (
         "Nd_col", "CCN_col", "lwc_col", "sigmaw_col", "regime_col", "Ndriz_col",
         "drizzle_threshold", "n_bins", "binning", "min_n",
     )}
-    cam_kwargs = {k: compute_kwargs[k] for k in (
+    cam_kwargs = {k: COMPUTE_KWARGS[k] for k in (
         "cam_Nd_var", "cam_CCN_var", "cam_sigmaw_var", "cam_rain_var", "cam_rain_threshold",
         "cam_temp_threshold_K", "cam_regime_map", "n_bins", "binning", "min_n",
     )}
@@ -237,6 +241,24 @@ def sensitivity_vs_sigmaw_2x2_obs_cam(adf, All_rf_df, ds_cams, campaign):
             # interrupted run actually resumes from here next time
             # instead of silently redoing every case from scratch:
             cdog.atomic_pickle_dump(enough_sens, data_pkl)
+
+    return enough_sens
+
+
+#cloud regimes
+def sensitivity_vs_sigmaw_2x2_obs_cam(adf, All_rf_df, ds_cams, campaign):
+    # Example usage of the microphysics processes plotting function
+    # Adjust the variable names and datasets as needed
+
+    #Notify user that script has started:
+    msg = "\n  Generating CAM-Obs Sigma w sensitivity plots..."
+    print(f"{msg}\n  {'-' * (len(msg)-3)}")
+
+    plot_loc = Path(adf.plot_location)
+    yup = Path(adf.config_file_dict["name"])
+    website_dir = plot_loc / "website"
+
+    enough_sens = load_sensitivity_sources(adf, All_rf_df, ds_cams, campaign)
 
     # JSON exports: one file per named source (Obs + each CAM case), plus a
     # single combined file for the D3 dashboard.

@@ -15,6 +15,7 @@ xr.set_options(file_cache_maxsize=1)       # do NOT set 0 on your xarray version
 #import dask.array as da
 
 import cam_diagnostic as cdog
+from .sensitivity_vs_sigmaw_2x2_obs_cam import load_sensitivity_sources
 
 #cloud regimes
 def alpha_sigmaw_regime_comparison_2x2(adf, All_rf_df, ds_cams, campaign, cam_desc):
@@ -24,9 +25,14 @@ def alpha_sigmaw_regime_comparison_2x2(adf, All_rf_df, ds_cams, campaign, cam_de
     #Notify user that script has started:
     msg = "\n  Generating CAM-Obs Sigma W Regime Comparison plots..."
     print(f"{msg}\n  {'-' * (len(msg)-3)}")
+
+    # The same obs/CAM tables the sensitivity diagnostic computes, from its
+    # cache: CAM data is only read for cases that are not cached yet.
+    sources = load_sensitivity_sources(adf, All_rf_df, ds_cams, campaign)
+
     fig, axes, out = cdog.plot_alpha_sigmaw_regime_comparison_2x2(
             df_obs=All_rf_df,
-            cam_cases=ds_cams,
+            cam_cases=list(ds_cams),
             Nd_col="CONCD_RWIO",
             lwc_col="PLWCD_RWIO",
             CCN_col="Nccn_UH_CVIU",
@@ -45,6 +51,7 @@ def alpha_sigmaw_regime_comparison_2x2(adf, All_rf_df, ds_cams, campaign, cam_de
             min_n=50,
             binning="quantile",
             figsize=(10, 8),
+            sources=sources,
         )
     print("len(ds_cams.keys())",len(ds_cams.keys()))
     if len(ds_cams.keys()) > 1:

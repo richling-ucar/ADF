@@ -266,19 +266,21 @@ def cam_obs_nd_lwc_pdf(adf, All_rf_df, ds_cams, campaign):
         "stratocumulus_lwc": ("StratocumulusLWC", "Stratocumulus LWC"),
     }
 
-    def _make_and_register_suite(ds_cams_subset, cam_desc, img_base):
+    def _make_and_register_suite(cases, cam_desc, img_base):
         """
         Build one summary (2x2) figure + its 4 individually-saved
-        component panels for `ds_cams_subset`, and register all 5 with
-        the website generator under `cam_desc`.
+        component panels for the case names in `cases`, drawn from the
+        cached `enough_pdf` (so no CAM data is read), and register all 5
+        with the website generator under `cam_desc`.
         """
         fig, axes, pdfs = cdog.plot_obs_cam_nd_lwc_pdfs(
                 All_rf_df=All_rf_df,
-                cam_cases=ds_cams_subset,
+                cam_cases=list(cases),
                 savepath=None,
                 save_indiv_panels=True,
                 indiv_plot_loc=plot_loc,
                 indiv_img_base=img_base,
+                pdf_stats=enough_pdf,
         )
 
         img_name = f'{img_base}.png'
@@ -308,9 +310,9 @@ def cam_obs_nd_lwc_pdf(adf, All_rf_df, ds_cams, campaign):
 
     # Every case also gets its own summary + component-panel suite (that
     # case alone vs Obs), regardless of how many cases are in this run:
-    for case, ds_cam_comp in ds_cams.items():
+    for case in ds_cams:
         img_base = f'{campaign}__nd_lwc__{case}'
-        _make_and_register_suite({case: ds_cam_comp}, case, img_base)
+        _make_and_register_suite([case], case, img_base)
 
 
 

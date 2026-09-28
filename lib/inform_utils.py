@@ -10,31 +10,36 @@ import xarray as xr
 import re
 from typing import Callable, Optional, Union, Tuple, Iterable, List, Dict
 from pathlib import Path
+import glob
+
+from scipy.spatial import cKDTree
 
 import adf_info as ADFInfo
-#icfinfo = ICFInfo
-#print("ICFInfo.ICFInfo.__campaigns",ICFInfo.ICFInfo.other_campaigns_dict())
-"""garbage = icfinfo.campaigns_dict
-print("garbage", garbage)"""
-'''icf: ICFInfo.ICFInfo | None = None
 
-def initialize(icf_obj: ICFInfo.ICFInfo):
-    """Initialize utility module state from the active ICFInfo object."""
-    global icf
-    icf = icf_obj
 
-def get_config_yaml() -> str:
-    """Return the active config file path from the initialized ICFInfo object."""
-    if icf is None:
-        raise RuntimeError("inform_utils has not been initialized with an ICFInfo instance")
-    return icf.config_yaml()
+def _campaign_cfg_for(campaigns_dict: dict, campaign: str) -> dict:
+    """
+    Look up one campaign's config values out of an AdfInfo-style
+    campaigns_dict.
 
-def _get_campaign_cfg() -> dict:
-    """Get the current campaigns config from the initialized ICFInfo object."""
-    if icf is None:
-        raise RuntimeError("inform_utils has not been initialized with an ICFInfo instance")
-    return icf.campaigns_dict
-'''
+    campaigns_dict is stored column-major - one list per config key,
+    each entry at the same index describing one campaign (see
+    AdfInfo.campaigns_dict / the "campaigns:" section of the config
+    YAML) - e.g. {"name": ["SOCRATES", "CSET"], "air_1hz_dir": [...],
+    ...}, not {"SOCRATES": {...}, "CSET": {...}}. This reconstructs the
+    single-campaign "row" (e.g. {"air_1hz_dir": ..., "ccn_dir": ...})
+    that the rest of this module's functions expect to do cfg.get(...)
+    lookups against.
+    """
+    names = campaigns_dict.get("name", [])
+    if campaign not in names:
+        raise ValueError(f"Unknown campaign '{campaign}'")
+    idx = names.index(campaign)
+    return {
+        key: (values[idx] if idx < len(values) else None)
+        for key, values in campaigns_dict.items()
+        if key != "name"
+    }
 
 
 def find_flight_fnames(campaign: str, freq: str = "air_1hz_dir", icf_obj=None) -> list[str]:
@@ -47,11 +52,11 @@ def find_flight_fnames(campaign: str, freq: str = "air_1hz_dir", icf_obj=None) -
         Campaign name ("SOCRATES", "CSET", etc.)
 
     freq : str
-        Data frequency key in CAMPAIGN_CFG
-        ("air_1hz", "air_25hz", "ccn")
+        Data frequency key in campaigns_dict
+        ("air_1hz_dir", "air_25hz_dir", "ccn_dir")
 
-    icf_obj : ICFInfo object, optional
-        If provided, use this object's campaigns_dict instead of the global one
+    icf_obj : an AdfInfo-like object exposing `.campaigns_dict`
+        (see _campaign_cfg_for). Required.
 
     Returns
     -------
@@ -59,16 +64,14 @@ def find_flight_fnames(campaign: str, freq: str = "air_1hz_dir", icf_obj=None) -
         List of flight NetCDF file paths
     """
 
-    campaign = campaign.upper()
-    if icf_obj is not None:
-        campaign_cfg = icf_obj.campaigns_dict
-    else:
-        campaign_cfg = _get_campaign_cfg()
+    if icf_obj is None:
+        raise ValueError("find_flight_fnames requires icf_obj (an AdfInfo-like object with .campaigns_dict)")
 
-    if campaign not in campaign_cfg:
-        raise ValueError(f"Unknown campaign '{campaign}'")
+    campaign = campaign.upper()
+    campaign_cfg = _campaign_cfg_for(icf_obj.campaigns_dict, campaign)
+
     print(campaign, freq)
-    dir_path = campaign_cfg[campaign][freq]
+    dir_path = campaign_cfg.get(freq)
 
     if dir_path is None:
         raise ValueError(f"{freq} not defined for campaign {campaign}")
@@ -551,10 +554,9 @@ def load_flight_data(
     tol: str = "1s",
     icf_obj=None,
 ) -> pd.DataFrame:
-    if icf_obj is not None:
-        cfg = icf_obj.campaigns_dict[campaign]
-    else:
-        cfg = _get_campaign_cfg()[campaign]
+    if icf_obj is None:
+        raise ValueError("load_flight_data requires icf_obj (an AdfInfo-like object with .campaigns_dict)")
+    cfg = _campaign_cfg_for(icf_obj.campaigns_dict, campaign)
 
     # --- 1 Hz aircraft ---
     flight_1hz_paths = find_flight_fnames(campaign, icf_obj=icf_obj)
@@ -614,23 +616,6 @@ def load_flight_data(
                 df = df2.set_index("Time").join(conc, how="left").reset_index()
 
     return df
-
-"""def load_ccn_for_campaign(campaign: str, icf_obj=None) -> pd.DataFrame | None:
-    if icf_obj is not None:
-        cfg = icf_obj.campaigns_dict[campaign]
-    else:
-        cfg = _get_campaign_cfg()[campaign]
-    ccn_dir = cfg.get("ccn_dir")
-    if not ccn_dir:
-        return None
-
-    exclude_substring = "spectra"
-    fnames = sorted(
-        f for f in os.listdir(ccn_dir)
-        if f.endswith(".ict") and exclude_substring not in f.lower()
-    )
-    paths = [os.path.join(ccn_dir, f) for f in fnames]
-    return load_all_ccn(paths)"""
 
 
 def find_sondes(dir_path: str) -> list[str]:
@@ -1098,6 +1083,1319 @@ def read_sonde(
     
     return dfs, nominal_times
 
+#======================================================================================
+# ERA5 cloud controlling factors and cloud regimes for dropsondes, and the dropsonde
+# composite (<campaign>_sonde_data_composite.nc) built from them.
+#
+# select_ERA5_4flight, wrap180, nearest_time_indices, collocate_ERA5_sonde and
+# cloud_regime_sonde are ported from the cookbook's process_data_products_utils.py
+# (see lib/test/inform_reference/).  select_ERA5_4flight differs only in using this
+# module's `datetime`/`timedelta` names (imported from the datetime module) instead
+# of `datetime.datetime`/`datetime.timedelta`.  build_sonde_composite and
+# sonde_composite_dataset follow the sonde cells of the cookbook notebook
+# INFORM_process_system_database.ipynb.
+#======================================================================================
+
+def select_ERA5_4flight(df, campaign, dat_type="aircraft"):
+    # Define function to filter ERA5 files based on time
+    def get_matching_files(pattern, start_dt, end_dt):
+        file_list = glob.glob(pattern)
+        selected = []
+        for file in file_list:
+            time_strs = file.split('.')[-2].split('_')
+            file_start = datetime.strptime(time_strs[0], "%Y%m%d%H")
+            file_end = datetime.strptime(time_strs[1], "%Y%m%d%H")
+            if file_start <= end_dt and file_end >= start_dt:
+                selected.append(file)
+        return selected
+    
+    filepath_sfc = "/glade/campaign/collections/rda/data/d633000/e5.oper.an.sfc/"
+    filepath_pl = "/glade/campaign/collections/rda/data/d633000/e5.oper.an.pl/"
+    # Extract the times of the research flight
+    month, year = df.Time[0].month, df.Time[0].year
+    day_start,day_end = df.Time[0].day, df.Time.iloc[-1].day
+    start_hour, end_hour = df.Time[0].hour, df.Time.iloc[-1].hour
+    
+    # Select the latitude/longitude box to reduce size of era5 data
+    if campaign == 'SOCRATES':
+        lat_max, lat_min = np.floor(df.GGLAT.min()), np.ceil(df.GGLAT.max())
+    elif campaign == 'CSET':
+        lat_min, lat_max = np.floor(df.GGLAT.min()), np.ceil(df.GGLAT.max())
+        
+    # ---- build lat/lon selection from the flight track ----
+    # Aircraft → 0..360 to match ERA5
+    lon0 = ((df.GGLON.to_numpy(dtype=float) % 360.0) + 360.0) % 360.0
+    lat0 = df.GGLAT.to_numpy(dtype=float)
+    
+    # Robust bounds (with a small pad for ERA5 0.25° grid)
+    pad = 0.5
+    lon_min = float(np.floor(np.nanmin(lon0) - pad))
+    lon_max = float(np.ceil (np.nanmax(lon0) + pad))
+    # keep inside ERA5 domain
+    lon_min = max(0.0, lon_min)
+    lon_max = min(359.999, lon_max)
+    
+    lat_min = float(np.floor(np.nanmin(lat0) - pad))
+    lat_max = float(np.ceil (np.nanmax(lat0) + pad))
+    
+    # ERA5 latitude is usually descending (90 → -90): use slice(max, min)
+    lat_slice = slice(lat_max, lat_min)
+    
+    # ERA5 longitudes are ascending (0 → 360): use slice(min, max)
+    lon_slice = slice(lon_min, lon_max)
+    
+    print("Selecting ERA5 box:",
+      f"lon {lon_min}→{lon_max} (0–360), lat {lat_max}→{lat_min} (descending)")
+
+    # Make the yearmonth string for file selection
+    dir_date = f"{year}{month:02d}"
+    
+    # Flight start and end times
+    start_dt = datetime(year, month, day_start, start_hour) 
+    end_dt = datetime(year, month, day_end, end_hour)+timedelta(hours=1)
+
+    # ---- apply the SAME slices to every dataset you open ----
+    ds_sp  = xr.open_mfdataset(get_matching_files(f"{filepath_sfc}{dir_date}/*_sp.*.nc", start_dt, end_dt),
+                                combine='by_coords').sel(latitude=lat_slice, longitude=lon_slice, time=slice(start_dt,end_dt))
+    ds_sst  = xr.open_mfdataset(get_matching_files(f"{filepath_sfc}{dir_date}/*_sstk.*.nc", start_dt, end_dt),
+                                combine='by_coords').sel(latitude=lat_slice, longitude=lon_slice, time=slice(start_dt,end_dt))
+    ds_t2m  = xr.open_mfdataset(get_matching_files(f"{filepath_sfc}{dir_date}/*_2t.*.nc", start_dt, end_dt),
+                                combine='by_coords').sel(latitude=lat_slice, longitude=lon_slice, time=slice(start_dt,end_dt))
+    ds_u10  = xr.open_mfdataset(get_matching_files(f"{filepath_sfc}{dir_date}/*_10u.*.nc", start_dt, end_dt),
+                                combine='by_coords')[['VAR_10U']].sel(latitude=lat_slice, 
+                                                                      longitude=lon_slice,time=slice(start_dt,end_dt))
+    ds_v10  = xr.open_mfdataset(get_matching_files(f"{filepath_sfc}{dir_date}/*_10v.*.nc", start_dt, end_dt),
+                                combine='by_coords')[['VAR_10V']].sel(latitude=lat_slice, longitude=lon_slice, 
+                                                                      time=slice(start_dt,end_dt))
+    
+    ds_w    = xr.open_mfdataset(get_matching_files(f"{filepath_pl}{dir_date}/*_w.*.nc",  start_dt, end_dt),
+                                combine='nested', concat_dim='time')
+    w_700   = ds_w['W'].sel(level=700).sortby('time').sel(latitude=lat_slice, longitude=lon_slice, time=slice(start_dt,end_dt))
+    
+    # ds_rh700 = xr.open_mfdataset(get_matching_files(f"{filepath_pl}{dir_date}/*_r.*.nc", start_dt, end_dt),
+    #                              combine='nested', concat_dim='time')[['R']].sel(level=700).drop_vars('level', errors='ignore')
+    # rh      = ds_rh700['R'].rename('RH').sortby('time').sel(latitude=lat_slice, longitude=lon_slice, 
+    # time=slice(start_dt,end_dt))
+    ds_q700  = xr.open_mfdataset(get_matching_files(f"{filepath_pl}{dir_date}/*_q.*.nc", start_dt, end_dt),
+                                 combine='nested', concat_dim='time')[['Q']].sel(level=700).drop_vars('level', errors='ignore')
+    q       = ds_q700['Q'].rename('Q').sortby('time').sel(latitude=lat_slice, longitude=lon_slice, time=slice(start_dt,end_dt))
+    ds_u700 = xr.open_mfdataset(get_matching_files(f"{filepath_pl}{dir_date}/*_u.*.nc", start_dt, end_dt),
+                                 combine='nested', concat_dim='time')[['U']].sel(level=700).drop_vars('level', errors='ignore')
+    ds_u700 = ds_u700.sortby('time').sel(latitude=lat_slice, longitude=lon_slice, time=slice(start_dt,end_dt))
+    ds_v700 = xr.open_mfdataset(get_matching_files(f"{filepath_pl}{dir_date}/*_v.*.nc", start_dt, end_dt),
+                                 combine='nested', concat_dim='time')[['V']].sel(level=700).drop_vars('level', errors='ignore')
+    ds_v700 = ds_v700.sortby('time').sel(latitude=lat_slice, longitude=lon_slice, time=slice(start_dt,end_dt))
+    
+    ds_t    = xr.open_mfdataset(get_matching_files(f"{filepath_pl}{dir_date}/*_t.*.nc", start_dt, end_dt),
+                                 combine='nested', concat_dim='time')[['T']].sel(level=800).drop_vars('level', errors='ignore')
+    ds_t    = ds_t.sortby('time').sel(latitude=lat_slice, longitude=lon_slice, time=slice(start_dt,end_dt))
+    ds_t700 = xr.open_mfdataset(get_matching_files(f"{filepath_pl}{dir_date}/*_t.*.nc", start_dt, end_dt),
+                                 combine='nested', concat_dim='time')[['T']].sel(level=700).drop_vars('level', errors='ignore')
+    ds_t700 = ds_t700.sortby('time').sel(latitude=lat_slice, longitude=lon_slice, time=slice(start_dt,end_dt))
+    ds_t850 = xr.open_mfdataset(get_matching_files(f"{filepath_pl}{dir_date}/*_t.*.nc", start_dt, end_dt),
+                                 combine='nested', concat_dim='time')[['T']].sel(level=850).drop_vars('level', errors='ignore')
+    ds_t850 = ds_t700.sortby('time').sel(latitude=lat_slice, longitude=lon_slice, time=slice(start_dt,end_dt))
+
+    ws = np.sqrt(ds_u10.VAR_10U**2 + ds_v10.VAR_10V**2)
+    wind_dir = (270 - np.degrees(np.arctan2(ds_v10.VAR_10V, ds_u10.VAR_10U))) % 360
+    
+    # Calculate RH from specfic humidity
+    # Murphy & Koop (2005) saturation vapor pressure (Pa)
+    def es_MK_water(T):
+        # ln(esw [Pa]) valid ~123–332 K
+        return xr.ufuncs.exp(54.842763 - 6763.22/T - 4.210*np.log(T) + 0.000367*T
+                             + xr.ufuncs.tanh(0.0415*(T-218.8)) * (53.878 - 1331.22/T - 9.44523*np.log(T) + 0.014025*T))
+    
+    def es_MK_ice(T):
+        # ln(esi [Pa]) valid ~110–273 K
+        return xr.ufuncs.exp(9.550426 - 5723.265/T + 3.53068*np.log(T) - 0.00728332*T)
+    
+    esw = es_MK_water(ds_t700.T)
+    esi = es_MK_ice(ds_t700.T)
+    # Choose water above freezing, ice at/below (adjust threshold if you prefer 273.16)
+    es = xr.where(ds_t700.T > 273.15, esw, esi)
+    
+    # Saturation specific humidity and RH
+    eps = 0.622
+    qsat = (eps * es) / (70000 - (1.0 - eps) * es)
+    
+    # Avoid division issues extremely near saturation/low p
+    qsat = qsat.clip(min=1e-12)
+    
+    RH = (q / qsat) * 100.0
+
+    # Calcualte wind shear (SFC - 700mb)
+    ws700 = np.sqrt(ds_u700.U**2 + ds_v700.V**2)
+    wind_shear = ws700-ws
+    
+    # Calculate M-value
+    Rd = 287
+    Cp = 1005   
+    theta_sfc = ds_t2m.VAR_2T*(101325/ds_sp.SP)**(Rd/Cp)
+    theta_800 = ds_t*(1013.25/800)**(Rd/Cp)
+    
+    M = theta_sfc.T - theta_800.T
+    M = M.transpose("time", "latitude", "longitude")
+    
+    dt = ds_t2m.VAR_2T - ds_sst.SSTK
+    
+    # Constants
+    Re = 6.371e6  # Earth radius in meters
+    deg2rad = np.pi / 180
+    phi = np.deg2rad(ds_sst.SSTK['latitude'])
+    # meters per 1° at this latitude
+    m_per_deg_lon = Re * np.cos(phi) * deg2rad
+    m_per_deg_lat = Re * deg2rad
+
+    if dat_type == "dropsonde": # Necessary to calculate delta x/y for dropsonde which only returns one column
+        # --- SST gradients & Tadv (K/day) ---
+        ds_sst2 = ds_sst.sortby(["latitude", "longitude"]).unify_chunks().chunk({"latitude": -1, "longitude": -1, "time": -1})
+
+        # gradients in K/m  (NOTE the division by meters-per-degree)
+        dT_dx = ds_sst2.SSTK.differentiate("longitude") / m_per_deg_lon   # K/m
+        dT_dy = ds_sst2.SSTK.differentiate('latitude') / m_per_deg_lat   # K/m
+
+    elif dat_type == "aircraft":
+        # gradients in K/m  (NOTE the division by meters-per-degree)
+        dT_dx = ds_sst.SSTK.differentiate("longitude") / m_per_deg_lon   # K/m
+        dT_dy = ds_sst.SSTK.differentiate('latitude') / m_per_deg_lat   # K/m
+ 
+    # advection: K/s -> K/day
+    Tadv = -(ds_u10['VAR_10U'] * dT_dx + ds_v10['VAR_10V'] * dT_dy) * 86400.0
+    # Convert to K/day
+    Tadv = Tadv.rename("Tadv")
+
+    # Calculate EIS following Wood and Bretherton (2006, J. Climate)
+    cp = 1004.     # specific heat at constant pressure for dry air (J / kg / K)
+    Rd = 287.         # gas constant for dry air (J / kg / K)
+    kappa = Rd / cp
+    Lhvap = 2.5e6    # Latent heat of vaporization (J / kg)
+    g = 9.81 # m/s^2
+    cp = 1004 # J/K/kg
+    Lv = 2.5e6 # J/kg
+    
+    Rv = 461 # J/K/kg;
+    Ra = 287 # J/K/kg
+    
+    def get_qsat(T,p):
+        Tcel = T-273.15
+        es=6.11*10**(7.5*Tcel/(Tcel+273.15))
+        return 0.622*es/p
+    
+    # Calculate lower tropospheric stability (LTS)
+    theta_700 = ds_t700.T*(1013.25/700)**kappa
+    LTS = theta_700 - theta_sfc
+    
+    # T850 = (ds_t2m.VAR_2T+ds_t700.T)/2
+    T850 = ds_t850.T
+    
+    Gammam = (g/cp*(1.0 - (1.0 + Lhvap*get_qsat(T850,850) / Rd / T850) /
+                 (1.0 + Lhvap**2 * get_qsat(T850,850)/ cp/Rv/T850**2)))
+    
+    # Assume exponential decrease of pressure with scale height given by surface temperature
+    z700 = (Rd * ds_t2m.VAR_2T / g) * np.log(1000 / 700)
+    # Assume 80% relative humidity to compute LCL, appropriate for marine boundary layer
+    Tadj = Tadj = ds_t2m.VAR_2T-55.  # in Kelvin
+    LCL = cp/g*(Tadj - (1/Tadj - np.log(0.8)/2840.)**(-1))    
+    EIS = LTS - Gammam*(z700 - LCL)
+
+    # Convert w700 (m/s) to pa/s
+    omega700 = -(70000 / (Rd * ds_t700.T)) * g * w_700
+    
+    # Merge the dataset variables used later
+    ds = {
+    'deltaT': dt,
+    'Tadv': Tadv,
+    'M': M,
+    'omega700': omega700,
+    'SST': ds_sst.SSTK,
+    'WS': ws,
+    'Wind_shear': wind_shear,
+    'RH700': RH,
+    'EIS': EIS
+     }
+
+    return ds
+
+def wrap180(lon):
+    # Map any longitude to [-180, 180)
+    return (lon + 180.0) % 360.0 - 180.0
+
+def nearest_time_indices(era5_times_ns, flight_times_ns):
+    # era5_times_ns: 1D int64 nanoseconds, sorted
+    # flight_times_ns: 1D int64 nanoseconds
+    idx_right = np.searchsorted(era5_times_ns, flight_times_ns, side="left")
+    idx_left  = np.clip(idx_right - 1, 0, len(era5_times_ns) - 1)
+    idx_right = np.clip(idx_right,       0, len(era5_times_ns) - 1)
+    choose_right = np.abs(era5_times_ns[idx_right] - flight_times_ns) < np.abs(era5_times_ns[idx_left] - flight_times_ns)
+    return np.where(choose_right, idx_right, idx_left)
+
+def collocate_ERA5_sonde(ds, df):
+    """
+    Collocate ERA5 gridded fields with dropsonde observations using
+    nearest-neighbor matching in space and time.
+
+    For each dropsonde observation, the function:
+        1. Finds the nearest ERA5 grid point using a KDTree built from
+           the ERA5 latitude/longitude grid.
+        2. Finds the nearest ERA5 time step to the sonde observation time.
+        3. Extracts ERA5 variables at that grid point and time.
+        4. Appends those values as new columns to the dropsonde dataframe.
+
+    Longitude matching is performed in a [-180°, 180°) coordinate system
+    to avoid issues near the dateline.
+
+    Parameters
+    ----------
+    ds : xarray.Dataset or dict-like
+        ERA5 dataset containing the variables to collocate. Expected
+        dimensions are ('time', 'latitude', 'longitude').
+
+        Required variables:
+            SST
+            M
+            omega700
+            deltaT
+            WS
+            Wind_shear
+            Tadv
+            RH700
+            EIS
+
+    df : pandas.DataFrame
+        Dropsonde dataframe containing observation coordinates and time.
+
+        Required columns:
+            GGLAT   : latitude (degrees)
+            GGLON   : longitude (degrees)
+            Time    : observation time (datetime-like)
+
+    Returns
+    -------
+    df : pandas.DataFrame
+        Same dataframe with additional columns containing collocated ERA5
+        values at the nearest grid point and time:
+
+            ERA5_SST
+            M
+            Omega700
+            deltaT
+            Wind_sp
+            Wind_shear
+            Tadv
+            RH700
+            EIS
+    Notes
+    -----
+    - Spatial matching uses Euclidean distance in lat/lon space via
+      scipy.spatial.cKDTree.
+    - Temporal matching uses nearest neighbor in ERA5 time.
+    - Rows with missing latitude, longitude, or time receive NaN values
+      for all collocated variables.
+    - ERA5 variables are loaded into memory as NumPy arrays for fast
+      indexing.
+    """
+    
+    # ---------------- core collocation block ----------------
+    ds = xr.Dataset(ds)
+    
+    # ERA5 coords
+    lat_vals = ds['latitude'].values.astype(float)
+    lon_vals_ds = ds['longitude'].values.astype(float)
+    
+    # Build KDTree in [-180,180) to avoid wrap issues
+    lon_vals_wrapped = wrap180(lon_vals_ds)
+    lon_grid, lat_grid = np.meshgrid(lon_vals_wrapped, lat_vals, indexing="xy")  # (nx,ny) if xy; use ij below
+    # use ij orientation for unravel consistency:
+    YY, XX = np.meshgrid(lat_vals, lon_vals_wrapped, indexing="ij")  # (ny,nx)
+    tree = cKDTree(np.c_[YY.ravel(), XX.ravel()])
+    ny, nx = YY.shape  # (lat, lon)
+    
+    # ERA5 time (sorted)
+    t_era = ds['time'].values.astype('datetime64[ns]')
+    t_era_ns = t_era.view('int64')
+    
+    # Preload arrays into NumPy (T,Y,X) for fast indexing
+    def arr3(name):
+        return ds[name].transpose('time', 'latitude', 'longitude').compute().values
+    
+    arr = {
+        'ERA5_SST':     arr3('SST'),
+        'M':            arr3('M'),
+        'Omega700':     arr3('omega700'),
+        'deltaT':       arr3('deltaT'),
+        'Wind_sp':      arr3('WS'),
+        'Wind_shear':   arr3('Wind_shear'),
+        'Tadv':         arr3('Tadv'),
+        'RH700':        arr3('RH700'),
+        'EIS':          arr3('EIS'),
+    }
+    
+    # Flight coords/time
+    flt_lat = df['GGLAT'].to_numpy(float)
+    flt_lon = wrap180(df['GGLON'].to_numpy(float))  # match KDTree frame
+    flt_t   = pd.to_datetime(df['Time'].values).to_numpy('datetime64[ns]')
+    flt_t_ns = flt_t.view('int64')
+    
+    N = len(df)
+    
+    # Mask rows we can sample (ignore NaNs)
+    valid = np.isfinite(flt_lat) & np.isfinite(flt_lon) & np.isfinite(flt_t_ns)
+    
+    # If nothing valid, just make the output columns full NaN and return df as-is
+    if not np.any(valid):
+        for out_name in arr.keys():
+            df[out_name] = np.nan
+    else:
+        # Nearest time indices for valid rows only
+        ti_valid = nearest_time_indices(t_era_ns, flt_t_ns[valid])  # (M,)
+    
+        # Nearest gridpoint for valid rows
+        _, flat_idx = tree.query(np.c_[flt_lat[valid], flt_lon[valid]])  # (M,)
+        yi, xi = np.unravel_index(flat_idx, (ny, nx))                    # (M,), (M,)
+    
+        # Gather each variable and scatter back into full-length columns (NaN elsewhere)
+        for out_name, A in arr.items():   # A: (T,ny,nx)
+            vals_valid = A[ti_valid, yi, xi]              # (M,)
+            out_full = np.full(N, np.nan, dtype=float)    # default NaN
+            out_full[valid] = vals_valid
+            df[out_name] = out_full
+
+    return df
+
+def cloud_regime_sonde(df, campaign, min_valid=5):
+    """
+    Assign a single cloud_regime label to an entire dropsonde dataframe
+    based on block-mean (NaN-excluded) cloud controlling factors.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Dropsonde dataframe containing ERA5_SST, M, RH700, Tadv, Wind_sp,
+        Wind_shear, EIS, etc.
+    campaign : str
+        'SOCRATES' or 'CSET'
+    min_valid : int
+        Minimum required valid samples when computing mean()
+
+    Returns
+    -------
+    df : pandas.DataFrame
+        Same dataframe with new column 'cloud_regime' filled with a single label
+    """
+
+    def mean_if_enough(x, nmin=min_valid):
+        """Return mean(x) if enough valid samples exist, else NaN."""
+        vals = x.to_numpy(dtype=float)
+        return float(np.nanmean(vals)) if np.isfinite(vals).sum() >= nmin else np.nan
+
+    # --- compute block means ---
+    M_mean          = mean_if_enough(df.get("M"))
+    RH700_mean      = mean_if_enough(df.get("RH700"))
+    SST_mean        = mean_if_enough(df.get("ERA5_SST"))
+    Tadv_mean       = mean_if_enough(df.get("Tadv"))
+    Wind_sp_mean    = mean_if_enough(df.get("Wind_sp"))
+    Wind_shear_mean = mean_if_enough(df.get("Wind_shear"))
+    EIS_mean        = mean_if_enough(df.get("EIS"))
+
+    # default label
+    label = "Unknown"
+
+    # ===========================
+    #     SOCRATES RULE SET
+    # ===========================
+    if campaign.upper() == "SOCRATES":
+
+        # --- Open-cell cumulus ---
+        cond_open = (
+            # 1) M >= -7 & WS >= 9
+            (np.isfinite(M_mean) and np.isfinite(Wind_sp_mean) and
+             M_mean >= -7 and Wind_sp_mean >= 9)
+            or
+            # 2) M >= -8 & EIS < 9
+            (np.isfinite(M_mean) and np.isfinite(EIS_mean) and
+             M_mean >= -8 and EIS_mean < 9)
+            or
+            # 3) M >= -8 & wshear > 6
+            (np.isfinite(M_mean) and np.isfinite(Wind_shear_mean) and
+             M_mean >= -8 and Wind_shear_mean > 6)
+        )
+
+        # --- Stratocumulus ---
+        cond_strat = (
+            # 1) M < -9 & WS < 9
+            (np.isfinite(M_mean) and np.isfinite(Wind_sp_mean) and
+             M_mean < -9 and Wind_sp_mean < 9)
+            or
+            # 2) M < -10 & EIS > 7
+            (np.isfinite(M_mean) and np.isfinite(EIS_mean) and
+             M_mean < -10 and EIS_mean > 7)
+            or
+            # 3) M < -10 & wshear < 9
+            (np.isfinite(M_mean) and np.isfinite(Wind_shear_mean) and
+             M_mean < -10 and Wind_shear_mean < 9)
+        )
+
+        if cond_open:
+            label = "Open-Cell"
+        if cond_strat:
+            # Stratocumulus overrides if both are true
+            label = "Stratocumulus"
+
+    # ===========================
+    #        CSET RULE SET
+    # ===========================
+    elif campaign.upper() == "CSET":
+
+        cond_strat = (
+            (np.isfinite(M_mean) and np.isfinite(SST_mean)  and M_mean < -10 and SST_mean < 295)
+            or
+            (np.isfinite(M_mean) and np.isfinite(Tadv_mean) and M_mean < -10 and Tadv_mean < 0)
+        )
+
+        cond_opencu = (
+            (np.isfinite(M_mean) and np.isfinite(SST_mean)  and M_mean >= -10 and SST_mean >= 296)
+            or
+            (np.isfinite(M_mean) and np.isfinite(Tadv_mean) and M_mean >= -4)
+        )
+
+        if cond_strat:
+            label = "Stratocumulus"
+        if cond_opencu:
+            label = "Open-Cell"
+
+    # add a single label to the entire df
+    df = df.copy()
+    df["cloud_regime"] = label
+    return df
+
+
+def sonde_composite_dataset(all_sondes, campaign):
+    """
+    Turn the per-sonde table into the composite dataset, as the cookbook notebook
+    writes it: CSET gets its dtypes fixed, columns renamed to the SOCRATES names
+    and zlib compression; SOCRATES is written as it is.
+
+    Parameters
+    ----------
+    all_sondes : pandas.DataFrame
+        Every sonde, collocated with ERA5 and labelled with its cloud regime.
+    campaign : str
+        "SOCRATES" or "CSET".
+
+    Returns
+    -------
+    tuple of (xarray.Dataset, dict or None)
+        The dataset and the netCDF encoding to write it with.
+    """
+    if campaign == 'CSET':
+        # --- copy to avoid side effects ---
+        d = all_sondes.copy()
+
+        # --- fix dtypes so netCDF can serialize ---
+        d["Time"] = pd.to_datetime(d["Time"], utc=True, errors="coerce").dt.tz_convert(None)
+
+        # RF / drop_num: real numpy ints (netcdf-safe)
+        for c in ["RF", "drop_num"]:
+            if c in d.columns:
+                d[c] = pd.to_numeric(d[c], errors="coerce").fillna(-1).astype(np.int16)
+
+        # strings: MUST be plain python str/object, NOT pandas "string"
+        for c in ["cloud_regime", "drop_id", "trajectory"]:
+            if c in d.columns:
+                d[c] = d[c].fillna("").astype(str)
+
+        # OPTIONAL: drop header junk if it exists
+        for c in ["--", "UTC"]:
+            if c in d.columns:
+                d = d.drop(columns=[c])
+
+        # OPTIONAL: rename to match SOCRATES naming
+        rename_map = {
+            "Press": "pres",
+            "Temp": "tdry",
+            "Dewpt": "dp",
+            "RH": "rh",
+            "Uwind": "u_wind",
+            "Vwind": "v_wind",
+            "Wspd": "wspd",
+            "Dir": "wdir",
+            "GPSAlt": "gpsalt",
+            "GeoPoAlt": "alt",
+        }
+        d = d.rename(columns={k: v for k, v in rename_map.items() if k in d.columns})
+
+        # --- make a simple RangeIndex called 'index' like SOCRATES ---
+        d = d.reset_index(drop=True)
+        d.index.name = "index"
+
+        # --- convert to xarray in the SAME "flat table" layout ---
+        ds = xr.Dataset.from_dataframe(d)
+        # --- compression (skip strings + datetimes) ---
+        encoding = {}
+        for v in ds.data_vars:
+            if ds[v].dtype.kind in ("U", "S", "O", "M"):  # M = datetime64
+                continue
+            encoding[v] = {"zlib": True, "complevel": 4}
+        return ds, encoding
+
+    if campaign == 'SOCRATES':
+        return xr.Dataset.from_dataframe(all_sondes), None
+
+    raise ValueError(f"No sonde composite layout for campaign '{campaign}'")
+
+
+def build_sonde_composite(campaign, sonde_paths, out_file=None):
+    """
+    Build the dropsonde composite from raw sonde files: read every sonde,
+    collocate it with ERA5 cloud controlling factors, label its cloud regime,
+    and combine them into one dataset.
+
+    Parameters
+    ----------
+    campaign : str
+        "SOCRATES" or "CSET".
+    sonde_paths : list
+        Raw sonde files (.nc, .cls or .eol), e.g. from find_sondes().
+    out_file : str or pathlib.Path, optional
+        Where to write the composite.  It is written to a temporary file first
+        and then moved into place, so an interrupted run never leaves a
+        truncated composite behind for the next run to reuse.
+
+    Returns
+    -------
+    xarray.Dataset
+        The composite, as written.
+    """
+    dfs, _ = read_sonde(sonde_paths, campaign=campaign)
+    sonde_dat = []
+    for i in range(0, len(dfs)):
+        print(f'  sonde {i + 1} of {len(dfs)}')
+        ds = select_ERA5_4flight(dfs[i], campaign=campaign, dat_type='dropsonde')
+        # Collocate ERA5 data and calculate environmental controlling factors
+        sonde_coll = collocate_ERA5_sonde(ds, dfs[i])
+        # Regime each sonde based on average column value
+        regime_sonde = cloud_regime_sonde(sonde_coll, campaign=campaign)
+        sonde_dat.append(regime_sonde)
+    all_sondes = pd.concat(sonde_dat)
+
+    ds, encoding = sonde_composite_dataset(all_sondes, campaign)
+    if out_file is not None:
+        out_file = Path(out_file)
+        tmp_file = out_file.with_name(out_file.name + ".tmp")
+        ds.to_netcdf(tmp_file, encoding=encoding)
+        os.replace(tmp_file, out_file)
+    return ds
+
+
+#======================================================================================
+# Per-flight cloud regime files (<CAMPAIGN>_RF<nn>_<yyyymmdd>.nc): the aircraft data
+# blocked into flight maneuvers, collocated with ERA5 cloud controlling factors and
+# labelled with cloud regimes.
+#
+# VAP_process_flight_data, assign_flight_type, block_flight, collocate_ERA5_dat,
+# cloud_regime and write_RF_nc are ported from the cookbook's
+# process_data_products_utils.py.  write_RF_nc differs only in using this module's
+# `datetime` name (the class) and in taking an optional output directory; the
+# original writes to the working directory, which is still the default.
+# build_flight_cloud_regime_files follows the per-flight loop of the cookbook
+# notebook INFORM_process_system_database.ipynb.
+#======================================================================================
+
+def VAP_process_flight_data(df,i):
+    """
+    High-Level Function for Processing Flight Data in Value Added Products.
+
+    This function serves as the main entry point for processing flight data. It first calls 
+    `assign_flight_type` to assign flight types (e.g., 'level' or 'profile') to different segments of the flight 
+    based on altitude stability and time gaps. After flight types are assigned, it proceeds to categorize the data 
+    into different flight blocks (e.g., level flight in boundary layer, in-cloud profile flight, etc.) by calling 
+    the `block_flight` function.
+
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        A DataFrame containing flight data with at least the following columns:
+        - 'Time' (datetime): Time of each flight record.
+        - 'GGALT' (float): Altitude of the aircraft.
+        - 'PLWCD_' (float): Cloud Droplet Probe LWC.
+        - 'CONCD_' (float): Cloud Droplet Probe Number Concentration.
+
+    Returns:
+    --------
+    dict
+        A dictionary containing:
+        - 'DataFrame': A modified DataFrame with assigned flight types, cloud status, and location.
+        - 'flight_blocks': A dictionary of flight blocks categorized by flight type and cloud status.
+        - 'cloud_blocks': A dataframe of flight blocks including blocks of aircraft data inside cloud layers.
+
+    Notes:
+    ------
+    - The `assign_flight_type` function is responsible for determining whether the flight segments are 'level' or 'profile'.
+    - The `block_flight` function segments the flight data based on the assigned flight types and cloud status into specific blocks (e.g., 'Level BL', 'In-Cloud Profiles', etc.).
+    - The function ensures proper labeling of different flight segments for further analysis, including cloud status and location (e.g., boundary layer or free airspace).
+    """
+    # Function to assign flight type "Level" and "Profile" when in/out of cloud
+    dict_flight_type = assign_flight_type(df)
+
+    # Extract dataframe that has been modified from the assign_flight_type function
+    df_mod = dict_flight_type['DataFrame']
+    # Plot time series of aircraft defined flight blocks
+    # plot_block_ts(dict_flight_type,i)
+
+    # Run block flight function to return list of Dataframes of "blocked" flight data
+    flight_blocks = block_flight(df_mod)
+    # Function to assign cloud type from the HCR data
+    # flight_block_comp = assign_cloud_type_HCR(flight_blocks,dir,i)
+    
+    # Plot time series of HCR defined cloud types  
+    # plot_hcr_cloud_type(df_mod,flight_block_comp,i)
+    return flight_blocks
+
+def assign_flight_type(df):
+    """
+    Assigns flight type ('level' or 'profile') to each row of the input DataFrame based on stable altitude blocks 
+    and gaps between these blocks. The function uses rolling standard deviation of altitude to identify level legs
+    and combines consecutive blocks of stable altitude with a specified time gap threshold. Additionally, it labels 
+    flight segments as "level" for level legs and "profile" for the aircraft vertical profile.
+
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        The input DataFrame with at least the following columns:
+        - 'Time' (timestamp)
+        - 'GGALT' (altitude in meters)
+
+    Returns:
+    --------
+    pandas.DataFrame
+        The input DataFrame with a new column 'flight_type', where each row is assigned a flight type:
+        - 'level' for stable altitude periods
+        - 'profile' for gaps between stable altitude blocks
+
+    Example:
+    --------
+    df = pd.read_csv('flight_data.csv')  # Assuming the CSV contains relevant columns
+    df_with_flight_types = assign_flight_type(df)
+    """
+
+    #-----------------------------------------
+    #----- Find profiles and level legs ------
+    #-----------------------------------------
+    
+    # Define a time gap threshold to combine blocks (e.g., 120 seconds)
+    time_gap_threshold = pd.Timedelta(seconds=120)
+    
+    # Compute rolling standard deviation of altitude to smooth noise
+    df['rolling_std'] = df['GGALT'].rolling(window=10, center=True).std()
+    
+    # Identify where altitude remains stable within the threshold
+    df['stable'] = df['rolling_std'] < 3  # You can adjust the threshold (meters)
+    
+    # Assign unique block IDs when stability changes
+    df['block_id'] = (df['stable'] != df['stable'].shift()).cumsum()
+    
+    # Group by block_id and filter for long-duration stable blocks
+    block_info = df[df['stable']].groupby('block_id').agg(
+        start_time=('Time', 'first'),
+        end_time=('Time', 'last'),
+        lower_bound=('GGALT', 'min'),  # Minimum altitude (lower bound)
+        upper_bound=('GGALT', 'max'),  # Maximum altitude (upper bound)
+        duration=('Time', lambda x: x.max() - x.min())
+    )
+    
+    # Filter out short-duration blocks
+    valid_blocks = block_info[block_info['duration'] > pd.Timedelta(seconds=150)] ## EDIT?
+    
+    # Sort the blocks by start time
+    valid_blocks = valid_blocks.sort_values(by='start_time')
+    
+    # Define a time gap threshold to combine blocks (e.g., 120 seconds)
+    time_gap_threshold = pd.Timedelta(seconds=120)
+    
+    # Combine consecutive blocks that are less than the threshold apart
+    combined_blocks = []
+    previous_block = valid_blocks.iloc[0]
+    
+    for idx, current_block in valid_blocks.iloc[1:].iterrows():
+        # Check if the gap between the end time of the previous block and start time of the current block is below the threshold
+        if current_block['start_time'] - previous_block['end_time'] <= time_gap_threshold:
+            # Extend the previous block's end time to the current block's end time
+            previous_block['end_time'] = current_block['end_time']
+        else:
+            # If the gap is too large, append the previous block and update to the current block
+            combined_blocks.append(previous_block)
+            previous_block = current_block
+    
+    # Add the last block after the loop
+    combined_blocks.append(previous_block)
+    
+    # Convert combined blocks back to DataFrame
+    combined_blocks_df = pd.DataFrame(combined_blocks)
+    
+    # --- Identify and Label "Profiles" between "Level" (Stable) sections ---
+    
+    # Create a new column 'flight_type' to categorize the blocks as "level" or "profile"
+    combined_blocks_df['flight_type'] = 'level'  # By default, label as 'level'
+    
+    # Now identify the gaps between "level" blocks and label as "profile"
+    profile_blocks = []
+    for i in range(len(combined_blocks_df) - 1):
+        end_time_current = combined_blocks_df.iloc[i]['end_time']
+        start_time_next = combined_blocks_df.iloc[i + 1]['start_time']
+        
+        # If there's a gap between two 'level' blocks, label the gap as 'profile'
+        if start_time_next - end_time_current > time_gap_threshold:
+            # Assign 'profile' to the gap between two level blocks and calculate duration
+            profile_duration = start_time_next - end_time_current  # Duration of the profile block
+            
+            profile_blocks.append({
+                'start_time': end_time_current,
+                'end_time': start_time_next,
+                'flight_type': 'profile',
+                'duration': profile_duration
+            })
+    
+    # Convert 'profile_blocks' to DataFrame
+    profile_blocks_df = pd.DataFrame(profile_blocks)
+    
+    # Append profile blocks to the original combined blocks DataFrame
+    combined_blocks_with_profiles = pd.concat([combined_blocks_df, profile_blocks_df], ignore_index=True)
+    
+    # Sort again by time
+    combined_blocks_with_profiles = combined_blocks_with_profiles.sort_values(by='start_time')
+    
+    # Check for "Profile" after the Last Level Block
+    last_end_time = combined_blocks_with_profiles.iloc[-1]['end_time']
+    last_time_in_data = df['Time'].max()
+    
+    if last_time_in_data - last_end_time > time_gap_threshold:
+        # If the gap is greater than the threshold, consider it a "profile" block
+        profile_block = pd.DataFrame([{
+            'start_time': last_end_time,
+            'end_time': last_time_in_data,
+            'flight_type': 'profile',
+        }])
+    
+        # Concatenate the new profile block to the existing DataFrame
+        combined_blocks_with_profiles = pd.concat([combined_blocks_with_profiles, profile_block], ignore_index=True)
+    
+    # Check for "Profile" before the First Level Block, used for takeoff/landing
+    first_start_time = combined_blocks_with_profiles.iloc[0]['start_time']
+    first_time_in_data = df['Time'].min()
+    
+    if first_start_time - first_time_in_data > time_gap_threshold:
+        profile_block_before_first = pd.DataFrame([{
+            'start_time': first_time_in_data,
+            'end_time': first_start_time,
+            'flight_type': 'profile',
+        }])
+    
+        combined_blocks_with_profiles = pd.concat([profile_block_before_first, combined_blocks_with_profiles], ignore_index=True)
+    
+    # List of columns to remove
+    columns_to_remove = ['rolling_std','stable','block_id']
+    # Drop the specified columns from df2
+    df = df.drop(columns=columns_to_remove)
+    
+    # Add new column "flight_type" as either "level" or "profile"
+    for _, row in combined_blocks_with_profiles.iterrows():
+        flight_type = row['flight_type']
+        # Find rows in df2 where the time is between start_time and end_time
+        mask = (df['Time'] >= row['start_time']) & (df['Time'] <= row['end_time'])
+        df.loc[mask, 'flight_type'] = flight_type
+    # Assign the flight_type to the first few rows that fall before the first start_time in df1
+    df.loc[df['Time'] < first_start_time, 'flight_type'] = df.iloc[0]['flight_type']
+
+    #------------------------------
+    #----- Find cloud layers ------
+    #------------------------------
+    # Ensure 'Time' is in datetime format
+    df = df.copy()  # Avoid modifying original DataFrame
+    df['Time'] = pd.to_datetime(df['Time'])
+    
+    # Find best match for column names dynamically
+    plwc_col = next((col for col in df.columns if 'PLWCD' in col), None) or \
+           next((col for col in df.columns if 'PLWC' in col), None)
+    concd_col = next((col for col in df.columns if 'CONCD' in col), None)
+    # Add check if there are any cloudy periods
+    if not plwc_col or not concd_col:
+        print("Required columns not found. Skipping cloud detection.")
+        final_cloud_blocks = pd.DataFrame(columns=['start_time', 'end_time', 'lower_bound', 'upper_bound', 'duration', 'Location'])
+        df['cloud_status'] = 'Out-of-cloud'
+        df['Location'] = 'Free'
+    else:
+        df['blocked'] = (df[plwc_col] > 0.001) & (df[concd_col] > 10)
+        if not df['blocked'].any():
+            print("No valid cloud blocks found. Skipping cloud layer logic.")
+            final_cloud_blocks = pd.DataFrame(columns=['start_time', 'end_time', 'lower_bound', 'upper_bound', 'duration', 'Location'])
+            df['cloud_status'] = 'Out-of-cloud'
+            df['Location'] = 'Free'
+        else:
+            df['block_id'] = (df['blocked'] != df['blocked'].shift()).cumsum()
+            block_info = df[df['blocked']].groupby('block_id').agg(
+                start_time=('Time', 'first'),
+                end_time=('Time', 'last'),
+                lower_bound=('GGALT', 'min'),
+                upper_bound=('GGALT', 'max'),
+            )
+
+            # Calculate duration directly by subtracting start_time from end_time
+            block_info['duration'] = block_info['end_time'] - block_info['start_time']
+            
+            # Filter out short-duration blocks
+            min_vertical = 30  # Adjust as needed (100 meters in your case)
+            valid_blocks = block_info[(block_info['upper_bound'] - block_info['lower_bound']) > min_vertical].reset_index(drop=True)
+            
+            # Define the altitude difference and time gap thresholds
+            altitude_gap_threshold = 200  # Increased altitude gap threshold
+            # time_gap_threshold = pd.Timedelta(minutes=20)  # Time gap threshold for merging
+            
+            # Sort the valid blocks by their start time to process them in sequence
+            valid_blocks = valid_blocks.sort_values(by='lower_bound')
+            
+            # Initialize a list to store combined blocks
+            combined_blocks = []
+            previous_block = valid_blocks.iloc[0].to_dict()
+            
+            # Iterate through the blocks and merge those that are within the thresholds
+            for idx, current_block in valid_blocks.iloc[1:].iterrows():
+                # Calculate the altitude gap between the current block's lower bound and the previous block's upper bound
+                altitude_gap = abs(current_block['lower_bound'] - previous_block['upper_bound'])
+                
+                # Calculate the time gap between the current block's start time and the previous block's end time
+                time_gap = current_block['start_time'] - previous_block['end_time']
+                # Check if the altitude gap is within the threshold or if the time gap is within the allowed range for smaller altitudes
+                if altitude_gap <= altitude_gap_threshold :
+                    # If both criteria are met, merge the blocks
+                    previous_block['end_time'] = max(previous_block['end_time'], current_block['end_time'])  # Get the latest end time
+                    previous_block['start_time'] = min(previous_block['start_time'], current_block['start_time'])  # Get the earliest start time
+                    previous_block['upper_bound'] = max(previous_block['upper_bound'], current_block['upper_bound'])  # Update upper bound
+                    previous_block['lower_bound'] = min(previous_block['lower_bound'], current_block['lower_bound'])  # Update lower bound
+                    
+                    # Recalculate the duration for the merged block
+                    previous_block['duration'] = previous_block['end_time'] - previous_block['start_time']
+                else:
+                    # If the blocks are far apart, save the previous block and move to the next one
+                    combined_blocks.append(previous_block)
+                    previous_block = current_block.to_dict()
+            
+            # Add the last block after the loop
+            combined_blocks.append(previous_block)
+            
+            # Convert the merged blocks back into a DataFrame
+            combined_blocks_df = pd.DataFrame(combined_blocks)
+            
+            # Second check for merging adjacent blocks in combined_blocks_df
+            final_combined_blocks = []
+            previous_block = combined_blocks_df.iloc[0].to_dict()
+            
+            # Apply additional check for merging based on both time and altitude gap
+            for idx, current_block in combined_blocks_df.iloc[1:].iterrows():
+                # Calculate the altitude gap and time gap
+                altitude_gap = abs(current_block['lower_bound'] - previous_block['upper_bound'])
+                time_gap = current_block['start_time'] - previous_block['end_time']
+                
+                # Check for overlap in the altitude ranges
+                overlap_check = (current_block['lower_bound'] >= previous_block['lower_bound']) and (current_block['lower_bound'] <= previous_block['upper_bound'])
+            
+                # Check if both the altitude gap, time gap, or overlap condition is met
+                if altitude_gap <= altitude_gap_threshold or overlap_check:
+                    # Merge the blocks
+                    previous_block['end_time'] = max(previous_block['end_time'], current_block['end_time'])
+                    previous_block['start_time'] = min(previous_block['start_time'], current_block['start_time'])
+                    previous_block['upper_bound'] = max(previous_block['upper_bound'], current_block['upper_bound'])
+                    previous_block['lower_bound'] = min(previous_block['lower_bound'], current_block['lower_bound'])
+                    
+                    # Recalculate the duration for the merged block
+                    previous_block['duration'] = previous_block['end_time'] - previous_block['start_time']
+                else:
+                    # Save the previous block and move to the next one
+                    final_combined_blocks.append(previous_block)
+                    previous_block = current_block.to_dict()
+            
+            # Add the last block after the loop
+            final_combined_blocks.append(previous_block)
+            
+            # Convert the final combined blocks back into a DataFrame
+            final_cloud_blocks = pd.DataFrame(final_combined_blocks)
+
+            # Add 'cloud_status' based on whether altitude and time fall within any blocked region (in the cloud or out of cloud)
+            df['cloud_status'] = 'Out-of-cloud'  # Default label
+            # Loop through each block and label altitudes as "In-cloud" if they fall within the block's range
+            for _, block in final_cloud_blocks.iterrows():
+                # Create a mask that checks both altitude and time conditions
+                mask = (
+                    (df['GGALT'] >= block['lower_bound']) & (df['GGALT'] <= block['upper_bound']) &
+                    (df['Time'] >= block['start_time']) & (df['Time'] <= block['end_time'])
+                )
+                
+                # Apply the 'In-cloud' label where the mask is True
+                df.loc[mask, 'cloud_status'] = 'In-cloud'
+            
+            # List of columns to remove
+            columns_to_remove = ['blocked','block_id']
+            # Drop the specified columns from df2
+            df = df.drop(columns=columns_to_remove)
+        
+            df['Location'] = 'Free'
+            
+            # Find the minimum in-cloud altitude
+            min_ic_alt = np.min(final_cloud_blocks['lower_bound'])-5
+            mask = df.GGALT < min_ic_alt
+            # Define 
+            df.loc[mask, 'Location'] = 'BL'
+        
+            # Update the Location column based on the GGALT and cloud status
+            df.loc[df['GGALT'] < min_ic_alt, 'Location'] = 'BL'
+        
+            # --- Add Location to final_cloud_blocks DataFrame ---
+            # Add 'Location' based on the minimum in-cloud altitude
+            final_cloud_blocks['Location'] = final_cloud_blocks['lower_bound'].apply(
+                lambda x: 'BL' if x < min_ic_alt else 'Free'
+            )
+                # Add 'Location' based on the minimum in-cloud altitude
+            combined_blocks_with_profiles['Location'] = combined_blocks_with_profiles['lower_bound'].apply(
+                lambda x: 'BL' if x < min_ic_alt else 'Free'
+            )
+
+    # Sort the dataframe by Time for continuous time grouping
+    df = df.sort_values(by='Time')
+    # Remove rows where 'flight_type' is NaN
+    df = df.dropna(subset=['flight_type'])
+    # Create a new column 'block_id' to group continuous time periods based on flight_type, cloud_status, and Location
+    df['block_id'] = (df['flight_type'] != df['flight_type'].shift()) | \
+                      (df['cloud_status'] != df['cloud_status'].shift()) | \
+                      (df['Location'] != df['Location'].shift())
+    df['block_id'] = df['block_id'].cumsum()
+
+    Final_ds = {'DataFrame': df,
+                'flight_blocks': combined_blocks_with_profiles,
+                'Cloud_blocks': final_cloud_blocks
+               }
+    
+    return Final_ds
+
+def block_flight(df):
+    """
+    Segments a flight dataset into different flight block categories based on cloud status, location, and flight type.
+
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        A DataFrame containing flight data with at least the following columns:
+        - 'block_id' (int): Identifies different flight segments.
+        - 'Location' (str): Can be 'BL' (Boundary Layer) or 'Free' airspace.
+        - 'flight_type' (str): Can be 'level' or 'profile'.
+        - 'cloud_status' (str): Either 'In-cloud' or 'Out-of-cloud'.
+        - 'GGALT' (float): Altitude dbata, used for filtering profile segments.
+        - 'Time' (datetime): Used to filter level flight segments.
+
+    Returns:
+    --------
+    Flight_blocks : dict
+        A dictionary containing categorized flight data:
+        - 'Level BL': List of DataFrames for level flight in the boundary layer.
+        - 'In-Cloud Profiles': List of DataFrames for in-cloud profile flights with altitude variation > 30m.
+        - 'In-Cloud Level FT': List of DataFrames for level flights in free airspace within clouds.
+        - 'Out-of-cloud Level FT': List of DataFrames for level flights in free airspace, lasting at least 3 minutes.
+
+    Notes:
+    ------
+    - The function removes the first and last 'Level BL' periods to exclude takeoff/landing effects.
+    - Only level flights lasting more than 180 seconds are included in 'Out-of-cloud Level FT'.
+    - Profile flights are only included if their altitude change is greater than 30 meters.
+    """
+    # ---------- Level BL periods (KEEP ALL) ----------
+    out_of_cloud_bl = df[(df['Location'] == 'BL') & (df['flight_type'] == 'level')]
+    bl_ids = sorted(out_of_cloud_bl['block_id'].unique())
+    bl_blocks_ds = [df[df['block_id'] == i] for i in bl_ids]
+    
+    # Find In-Cloud profile periods
+    in_cloud_prof = df[(df['cloud_status'] == 'In-cloud') & (df['flight_type'] == 'profile')]
+    ic_prof_ids = sorted(in_cloud_prof['block_id'].unique())
+    ic_pro_blocks_ds = [df[df['block_id'] == i] for i in ic_prof_ids if df[df['block_id'] == i]['GGALT'].max() - df[df['block_id'] == i]['GGALT'].min() > 30]
+    
+    # Find level FT periods out-of-cloud
+    level_ft = df[(df['cloud_status'] == 'Out-of-cloud') & (df['flight_type'] == 'level') & (df['Location'] == 'Free')]
+    out_of_cloud_ft_ids = sorted(level_ft['block_id'].unique())
+    level_ft_out_blocks_ds = [df[df['block_id'] == i] for i in out_of_cloud_ft_ids if df[df['block_id'] == i]['Time'].iloc[-1] - df[df['block_id'] == i]['Time'].iloc[0] > pd.Timedelta(seconds=180)]
+
+    # Find level FT periods in-cloud
+    level_ft_ic = df[(df['cloud_status'] == 'In-cloud') & (df['flight_type'] == 'level') & (df['Location'] == 'Free')]
+    in_cloud_ft_ids = sorted(level_ft_ic['block_id'].unique())
+    level_ft_ic_blocks_ds = [df[df['block_id'] == i] for i in in_cloud_ft_ids]
+    
+    # Save blocks of flight as dictionary for output
+    Flight_blocks = {
+        'Level BL': bl_blocks_ds,
+        'In-Cloud Profiles': ic_pro_blocks_ds,
+        'In-Cloud Level FT': level_ft_ic_blocks_ds,
+        'Out-of-cloud Level FT': level_ft_out_blocks_ds
+    }
+
+    return Flight_blocks
+
+def collocate_ERA5_dat(ds, blocks):
+    """
+    Collocate ERA5 fields onto flight blocks.
+    Assumes ds variables have dims ('time','latitude','longitude') and longitude is 0..360 ascending.
+    """
+
+    # Ensure Dataset and time sorted
+    ds = xr.Dataset(ds).sortby('time')
+
+    # Coords (ERA5 already 0..360)
+    lat_vals = ds['latitude'].values
+    lon_vals = ds['longitude'].values
+    ny, nx   = lat_vals.size, lon_vals.size
+
+    # KDTree over regular lat-lon grid (0..360 frame)
+    lon_grid, lat_grid = np.meshgrid(lon_vals, lat_vals)
+    tree = cKDTree(np.column_stack((lat_grid.ravel(), lon_grid.ravel())))
+
+    # ERA5 times (ns, sorted)
+    t_era_ns = ds['time'].values.astype('datetime64[ns]').view('int64')
+
+    # Pull arrays once (T,Y,X) as NumPy
+    def arr3(name):
+        return ds[name].transpose('time','latitude','longitude').compute().values
+
+    arr = {
+        'ERA5_SST':   arr3('SST'),
+        'M':          arr3('M'),
+        'omega700':       arr3('omega700'),
+        'deltaT':     arr3('deltaT'),
+        'Wind_sp':    arr3('WS'),
+        'Wind_shear': arr3('Wind_shear'),
+        'Tadv':       arr3('Tadv'),
+        'RH700':      arr3('RH700'),
+        'EIS':        arr3('EIS'),
+    }
+
+    # Loop blocks
+    for key, blist in blocks.items():
+        for i, block in enumerate(blist):
+            b = block.copy().dropna(subset=['GGLAT','GGLON'])
+            if len(b) == 0:
+                blist[i] = b
+                continue
+
+            # Flight coords/time (convert lon to 0..360)
+            flt_lat  = b['GGLAT'].to_numpy(dtype=float)
+            flt_lon  = ((b['GGLON'].to_numpy(dtype=float) % 360.0) + 360.0) % 360.0
+            flt_t_ns = b['Time'].to_numpy('datetime64[ns]').view('int64')
+
+            # Nearest time index per sample
+            ti = nearest_time_indices(t_era_ns, flt_t_ns)  # (N,)
+
+            # Nearest gridpoint (lat, lon) in 0..360 frame
+            _, flat_idx = tree.query(np.column_stack((flt_lat, flt_lon)))  # (N,)
+            yi, xi = np.unravel_index(flat_idx, (ny, nx))                  # (N,), (N,)
+
+            # Gather all variables
+            for out_name, A in arr.items():
+                b[out_name] = A[ti, yi, xi]
+
+            blist[i] = b
+        blocks[key] = blist
+
+    return blocks
+
+def cloud_regime(fblks, campaign):
+    """
+    Assign cloud_regime per block.
+
+    - SOCRATES:
+        Stratocumulus (cond_strat) if ANY of:
+            1) M < -9  and Wind_sp < 9
+            2) M < -10 and EIS > 7
+            3) M < -10 and Wind_shear < 9
+
+        Open-Cell (cond_open) if ANY of:
+            1) M >= -7 and Wind_sp >= 9
+            2) M >= -8 and EIS < 9
+            3) M >= -8 and Wind_shear > 6
+
+    - CSET:
+        Stratocumulus (cond_strat) if ANY of:
+            1) M < -10 and SST < 295
+            2) M < -11 and Tadv < 0
+
+        Open-Cell (cond_open) if ANY of:
+            1) M >= -10 and SST >= 296
+            2) M >= -10 and Tadv >= -4
+
+    Tie policy:
+        - Start everything as 'Undetermined'
+        - Assign 'Stratocumulus' only where cond_strat is True
+          AND cond_open is False
+        - Assign 'Open-Cell' only where cond_open is True
+          AND cond_strat is False
+        → Points that satisfy both or neither stay 'Undetermined'.
+    """
+
+    # Normalize campaign string a bit for safety
+    campaign = str(campaign).upper()
+
+    for val in fblks:
+        block_list = fblks[val]
+
+        for i in range(len(block_list)):
+            block = block_list[i].copy()
+
+            # Default: unknown / in-between regime
+            block['cloud_regime'] = pd.Series('Undetermined',
+                                              index=block.index,
+                                              dtype='object')
+
+            # =====================================================
+            # SOCRATES rules
+            # =====================================================
+            if campaign == 'SOCRATES':
+                # Required / optional fields
+                M   = block['M']
+                WS  = block.get('Wind_sp',
+                                pd.Series(np.nan, index=block.index))
+                EIS = block.get('EIS',
+                                pd.Series(np.nan, index=block.index))
+                WSH = block.get('Wind_shear',
+                                pd.Series(np.nan, index=block.index))
+
+                # Stratocumulus-favoring conditions
+                cond_strat = (
+                    ((M < -9)  & (WS  < 9)) |
+                    ((M < -10) & (EIS > 7)) |
+                    ((M < -10) & (WSH < 9))
+                )
+
+                # Open-cell-favoring conditions
+                cond_open = (
+                    ((M >= -7) & (WS  >= 9)) |
+                    ((M >= -8) & (EIS < 9))  |
+                    ((M >= -8) & (WSH > 6))
+                )
+
+                # Apply labels, with "Undetermined" winning ties
+                block.loc[cond_strat & ~cond_open, 'cloud_regime'] = 'Stratocumulus'
+                block.loc[cond_open  & ~cond_strat, 'cloud_regime'] = 'Open-Cell'
+
+            # =====================================================
+            # CSET rules
+            # =====================================================
+            elif campaign == 'CSET':
+                M    = block['M']
+                SST  = block.get('ERA5_SST',
+                                 block.get('sst',
+                                           pd.Series(np.nan, index=block.index)))
+                Tadv = block.get('Tadv',
+                                 pd.Series(np.nan, index=block.index))
+
+                # Stratocumulus-favoring conditions
+                cond_strat = (
+                    ((M < -10) & (SST < 296)) |
+                    ((M < -11) & (Tadv < 0))
+                )
+
+                # Open-cell-favoring conditions
+                cond_open = (
+                    ((M >= -10) & (SST >= 296)) |
+                    ((M >= -10) & (Tadv >= -3))
+                )
+
+                # Apply labels, with "Undetermined" winning ties
+                block.loc[cond_strat & ~cond_open, 'cloud_regime'] = 'Stratocumulus'
+                block.loc[cond_open  & ~cond_strat, 'cloud_regime'] = 'Open-Cell'
+
+            # Write back modified block
+            block_list[i] = block
+
+        # Update this entry in fblks
+        fblks[val] = block_list
+
+    return fblks
+
+def write_RF_nc(fblks_cr, rf, campaign, out_dir=None):
+    combined = []
+    if isinstance(fblks_cr, dict):
+        for label, df_list in fblks_cr.items():
+            for i, df in enumerate(df_list):
+                df = df.copy()
+                df["flight"] = rf
+                df["block_label"] = label
+                df["block_index"] = i
+                combined.append(df)
+
+        df_all = pd.concat(combined, ignore_index=True)
+        df_all = df_all.set_index(["block_label", "block_index", "Time"])
+        ds = df_all.reset_index().to_xarray()
+        today = datetime.today().strftime("%Y%m%d")        
+        # campaign prefix, no spaces, underscore separator
+        campaign_str = str(campaign).upper().replace(" ", "")
+        rf_str = str(rf).replace(" ", "_")
+        name = f"{campaign_str}_{rf_str}_{today}.nc"
+
+        if out_dir is not None:
+            name = str(Path(out_dir) / name)
+        ds.to_netcdf(name)
+        print(f"Wrote {name}")
+        return name
+
+
+def build_flight_cloud_regime_files(campaign, icf_obj, out_dir, flights=None):
+    """
+    Build the per-flight cloud regime files from the raw aircraft data: load
+    each research flight (with CCN and 25 Hz sigma_w where configured), block it
+    into flight maneuvers, collocate the blocks with ERA5 cloud controlling
+    factors, label their cloud regimes and write one netCDF file per flight.
+
+    Parameters
+    ----------
+    campaign : str
+        "SOCRATES" or "CSET".
+    icf_obj : AdfInfo-like
+        Object whose `campaigns_dict` gives "air_1hz_dir" and, optionally,
+        "air_25hz_dir" and "ccn_dir" for the campaign (see _campaign_cfg_for).
+    out_dir : str or pathlib.Path
+        Directory the files are written to.  Each name carries today's date,
+        so do not write into a directory that already holds files for the same
+        flights: anything globbing *RF*.nc there would read both.
+    flights : list of int, optional
+        Research flight numbers to build (1 = RF01).  Default: every flight.
+
+    Returns
+    -------
+    list of str
+        The files written.
+    """
+    ccn_df = load_ccn_for_campaign(campaign, icf_obj=icf_obj)  # loads once
+    flight_paths = find_flight_fnames(campaign, icf_obj=icf_obj)
+    if flights is None:
+        flights = range(1, len(flight_paths) + 1)
+    written = []
+    for rf_num in flights:
+        i = rf_num - 1
+        df = load_flight_data(campaign, i, ccn_df=ccn_df, icf_obj=icf_obj)
+
+        # RF12 is the only flight with this variable and it messes up the final product
+        if ('PLWC' in df.columns) and (campaign == 'SOCRATES'):
+            df = df.drop(columns=['PLWC'])
+        blocks = VAP_process_flight_data(df, i)
+
+        # Select ERA5 data
+        ds = select_ERA5_4flight(df, campaign)
+        rf_id = f"RF{i+1:02d}"
+        print(rf_id)
+
+        # Collocate ERA5 data and calculate environmental controlling factors
+        fblks_coll = collocate_ERA5_dat(ds, blocks)
+        # Select cloud regime type based on cloud controlling factors
+        fblks_cr = cloud_regime(fblks_coll, campaign=campaign)
+        # Write to NetCDF for this flight
+        written.append(write_RF_nc(fblks_cr, rf_id, campaign, out_dir=out_dir))
+    return written
+
+
 def load_nc_cldrgme(file_paths):
 
     combined_blocks = []   
@@ -1351,10 +2649,9 @@ def merge_two_ccn_streams_into_aircraft(df_aircraft, ccn_df, tolerance="5s"):
 
 
 def load_ccn_for_campaign(campaign: str, icf_obj=None) -> pd.DataFrame | None:
-    if icf_obj is not None:
-        cfg = icf_obj.campaigns_dict[campaign]
-    else:
-        cfg = _get_campaign_cfg()[campaign]
+    if icf_obj is None:
+        raise ValueError("load_ccn_for_campaign requires icf_obj (an AdfInfo-like object with .campaigns_dict)")
+    cfg = _campaign_cfg_for(icf_obj.campaigns_dict, campaign)
     ccn_dir = cfg.get("ccn_dir")
     if not ccn_dir:
         return None

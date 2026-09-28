@@ -829,7 +829,6 @@ def subset_cam_by_campaign(
     vars_to_keep: list[str] | None = None,
     drop: bool = True,       # drop points outside mask (shrinks time/lat/lon)
     add_qlwc: bool = True,   # add qlwc = Qc+Qr if present (g m^-3)
-    nc_savepath = "."
 ):
     """
     Return ds_cam masked by campaign-specific conditions built from ds_cam_ccfs.

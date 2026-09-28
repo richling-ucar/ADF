@@ -1698,9 +1698,17 @@ def plot_obs_cam_nd_lwc_pdfs(
     indiv_plot_loc=None,
     indiv_img_base=None,
     indiv_dpi=300,
+    pdf_stats=None,
 ):
     """
     Plot normalized 1D PDFs of Nd and LWC for observations and CAM6 by cloud regime.
+
+    `cam_cases` maps each case name to its composited CAM dataset.  When
+    `pdf_stats` is given it holds the PDFs already computed (e.g. cached) by
+    compute_obs_pdf_stats/compute_case_pdf_stats in cam_obs_nd_lwc_pdf.py,
+    {"Obs": {...}, <case>: {...}}, with the same bins and thresholds as here;
+    they are drawn as they are, `cam_cases` only needs the case names and
+    `All_rf_df` is not read.
 
     Assumes:
       Obs dataframe has:
@@ -1738,8 +1746,6 @@ def plot_obs_cam_nd_lwc_pdfs(
         regime: ds_cam_comp[cam_regime_keys[regime]]
         for regime in regimes_of_interest
     }"""
-
-    concd_col_obs, plwc_col_obs = find_obs_nd_lwc_columns(All_rf_df)
 
     pdf_Nd_obs = {}
     pdf_LWC_obs = {}
@@ -1858,43 +1864,54 @@ def plot_obs_cam_nd_lwc_pdfs(
     # draw from these same precomputed values instead of recomputing the
     # (non-cheap, dask-histogram-backed) CAM PDFs a second time.
     # --------------------------------------------------------------------
-    # "Stratocumulus", "Open-Cell"
-    for regime in regimes_of_interest:
-        # --------------------------
-        # Observations
-        # --------------------------
-        df_sub = All_rf_df[
-            (All_rf_df["block_label"].isin(labels_of_interest)) &
-            (All_rf_df["cloud_regime"] == regime) &
-            (All_rf_df[concd_col_obs] > obs_Nd_min) &
-            (All_rf_df[plwc_col_obs] > obs_LWC_min) &
-            (All_rf_df["ATX"] > T_min_C)
-        ]
+    if pdf_stats is not None:
+        for regime in regimes_of_interest:
+            key = cam_regime_keys[regime]
+            pdf_Nd_obs[regime] = pdf_stats["Obs"][f"Nd_{key}"]
+            pdf_LWC_obs[regime] = pdf_stats["Obs"][f"LWC_{key}"]
+            for cam_desc in cam_cases:
+                pdf_Nd_cam.setdefault(cam_desc, {})[regime] = pdf_stats[cam_desc][f"Nd_{key}"]
+                pdf_LWC_cam.setdefault(cam_desc, {})[regime] = pdf_stats[cam_desc][f"LWC_{key}"]
+    else:
+        concd_col_obs, plwc_col_obs = find_obs_nd_lwc_columns(All_rf_df)
 
-        pdf_Nd_obs[regime] = compute_pdf_1d(df_sub[concd_col_obs].values, Nd_bins)
-        pdf_LWC_obs[regime] = compute_pdf_1d(df_sub[plwc_col_obs].values, LWC_bins)
+        # "Stratocumulus", "Open-Cell"
+        for regime in regimes_of_interest:
+            # --------------------------
+            # Observations
+            # --------------------------
+            df_sub = All_rf_df[
+                (All_rf_df["block_label"].isin(labels_of_interest)) &
+                (All_rf_df["cloud_regime"] == regime) &
+                (All_rf_df[concd_col_obs] > obs_Nd_min) &
+                (All_rf_df[plwc_col_obs] > obs_LWC_min) &
+                (All_rf_df["ATX"] > T_min_C)
+            ]
 
-        # --------------------------
-        # CAM
-        # --------------------------
-        for cam_desc, ds_cam_comp in cam_cases.items():
+            pdf_Nd_obs[regime] = compute_pdf_1d(df_sub[concd_col_obs].values, Nd_bins)
+            pdf_LWC_obs[regime] = compute_pdf_1d(df_sub[plwc_col_obs].values, LWC_bins)
 
-            cam_ds = {regime: ds_cam_comp[cam_regime_keys[regime]]}
-            ds_reg = cam_ds[regime]
+            # --------------------------
+            # CAM
+            # --------------------------
+            for cam_desc, ds_cam_comp in cam_cases.items():
 
-            T_C = ds_reg["T_K"] - 273.15
+                cam_ds = {regime: ds_cam_comp[cam_regime_keys[regime]]}
+                ds_reg = cam_ds[regime]
 
-            mask = (
-                (T_C > T_min_C) &
-                (ds_reg["cam_lwc"] > cam_LWC_min) &
-                (ds_reg["cam_Nc"] > cam_Nd_min)
-            )
+                T_C = ds_reg["T_K"] - 273.15
 
-            Nd_cam_da = ds_reg["cam_Nc"].where(mask)
-            LWC_cam_da = ds_reg["cam_lwc"].where(mask)
+                mask = (
+                    (T_C > T_min_C) &
+                    (ds_reg["cam_lwc"] > cam_LWC_min) &
+                    (ds_reg["cam_Nc"] > cam_Nd_min)
+                )
 
-            pdf_Nd_cam.setdefault(cam_desc, {})[regime] = compute_pdf_dask(Nd_cam_da, Nd_bins)
-            pdf_LWC_cam.setdefault(cam_desc, {})[regime] = compute_pdf_dask(LWC_cam_da, LWC_bins)
+                Nd_cam_da = ds_reg["cam_Nc"].where(mask)
+                LWC_cam_da = ds_reg["cam_lwc"].where(mask)
+
+                pdf_Nd_cam.setdefault(cam_desc, {})[regime] = compute_pdf_dask(Nd_cam_da, Nd_bins)
+                pdf_LWC_cam.setdefault(cam_desc, {})[regime] = compute_pdf_dask(LWC_cam_da, LWC_bins)
 
     # ------------------------------------------------------------------
     # Panel-drawing helper. Fully draws a single panel (data, title, axis
@@ -2983,6 +3000,7 @@ def plot_alpha_sigmaw_regime_comparison_2x2(
         binning="quantile",
         min_n=50,
         figsize=(10, 8),
+        sources=None,
     ):
     """
     Compare observed and modeled
@@ -3003,72 +3021,39 @@ def plot_alpha_sigmaw_regime_comparison_2x2(
             "NudgeUVT 24h": cam_df,
             ...
         }
+    sources : dict, optional
+        Precomputed tables, {"Obs": obs_df, <case>: cam_df, ...}, as cached by
+        sensitivity_vs_sigmaw_2x2_obs_cam.load_sensitivity_sources; when given,
+        `df_obs` is not read and `cam_cases` only needs the case names.
     """
 
-    # OBS binned α
-    obs_out = slope_logNd_logCCN_vs_sigmaw(
-        df_obs,
-        Nd_col=Nd_col,
-        CCN_col=CCN_col,
-        lwc_col=lwc_col,
-        sigmaw_col=sigmaw_col,
-        regime_col=regime_col,
-        Ndriz_col=Ndriz_col,
-        regimes=regimes,
-        n_bins=n_bins,
-        binning=binning,
-        min_n=min_n,
-        drizzle_threshold=drizzle_threshold,
-    ).copy()
-    if len(obs_out):
-        obs_out["source"] = "OBS"
-
-    # CAM binned α
-    """cam_out = cam_binned_alpha_vs_sigmaw(
-        ds_cam_comp,
-        cam_Nd_var=cam_Nd_var,
-        cam_CCN_var=cam_CCN_var,
-        cam_sigmaw_var=cam_sigmaw_var,
-        cam_rain_var=cam_rain_var,
-        cam_rain_threshold=cam_rain_threshold,
-        temp_threshold_K=cam_temp_threshold_K,
-        cam_lwc_var="cam_lwc",      # <-- set correctly
-        lwc_threshold=1e-3,         # <-- set correctly for your units
-        regimes=regimes,
-        cam_regime_map=cam_regime_map,
-        n_bins=n_bins,
-        binning=binning,
-        min_n=min_n,
-    )"""
-
-    """cam_outs = {}
-
-    for case_name, ds_case in cam_cases.items():
-
-        cam_outs[case_name] = cam_binned_alpha_vs_sigmaw(
-            ds_case,
-            cam_Nd_var=cam_Nd_var,
-            cam_CCN_var=cam_CCN_var,
-            cam_sigmaw_var=cam_sigmaw_var,
-            cam_rain_var=cam_rain_var,
-            cam_rain_threshold=cam_rain_threshold,
-            temp_threshold_K=cam_temp_threshold_K,
-            cam_lwc_var="cam_lwc",
-            lwc_threshold=1e-3,
+    if sources is not None:
+        # Tables already computed (and cached) by the sensitivity-vs-sigma_w
+        # diagnostic, with the same settings: nothing is recomputed and
+        # cam_cases only needs the case names.
+        obs_out = sources["Obs"]
+        cam_outs = {case_name: sources[case_name] for case_name in cam_cases}
+    else:
+        # OBS binned α
+        obs_out = slope_logNd_logCCN_vs_sigmaw(
+            df_obs,
+            Nd_col=Nd_col,
+            CCN_col=CCN_col,
+            lwc_col=lwc_col,
+            sigmaw_col=sigmaw_col,
+            regime_col=regime_col,
+            Ndriz_col=Ndriz_col,
             regimes=regimes,
-            cam_regime_map=cam_regime_map,
             n_bins=n_bins,
             binning=binning,
             min_n=min_n,
-        )"""
-    
-    cam_outs = {}
+            drizzle_threshold=drizzle_threshold,
+        ).copy()
+        if len(obs_out):
+            obs_out["source"] = "OBS"
 
-    for case_name, ds_cam_comp in cam_cases.items():
-
-        print(f"Processing {case_name}")
-
-        cam_out = cam_binned_alpha_vs_sigmaw(
+        # CAM binned α
+        """cam_out = cam_binned_alpha_vs_sigmaw(
             ds_cam_comp,
             cam_Nd_var=cam_Nd_var,
             cam_CCN_var=cam_CCN_var,
@@ -3076,18 +3061,62 @@ def plot_alpha_sigmaw_regime_comparison_2x2(
             cam_rain_var=cam_rain_var,
             cam_rain_threshold=cam_rain_threshold,
             temp_threshold_K=cam_temp_threshold_K,
-            cam_lwc_var="cam_lwc",
-            lwc_threshold=1e-3,
+            cam_lwc_var="cam_lwc",      # <-- set correctly
+            lwc_threshold=1e-3,         # <-- set correctly for your units
             regimes=regimes,
             cam_regime_map=cam_regime_map,
             n_bins=n_bins,
             binning=binning,
             min_n=min_n,
-        )
+        )"""
 
-        cam_out["case"] = case_name
+        """cam_outs = {}
 
-        cam_outs[case_name] = cam_out
+        for case_name, ds_case in cam_cases.items():
+
+            cam_outs[case_name] = cam_binned_alpha_vs_sigmaw(
+                ds_case,
+                cam_Nd_var=cam_Nd_var,
+                cam_CCN_var=cam_CCN_var,
+                cam_sigmaw_var=cam_sigmaw_var,
+                cam_rain_var=cam_rain_var,
+                cam_rain_threshold=cam_rain_threshold,
+                temp_threshold_K=cam_temp_threshold_K,
+                cam_lwc_var="cam_lwc",
+                lwc_threshold=1e-3,
+                regimes=regimes,
+                cam_regime_map=cam_regime_map,
+                n_bins=n_bins,
+                binning=binning,
+                min_n=min_n,
+            )"""
+    
+        cam_outs = {}
+
+        for case_name, ds_cam_comp in cam_cases.items():
+
+            print(f"Processing {case_name}")
+
+            cam_out = cam_binned_alpha_vs_sigmaw(
+                ds_cam_comp,
+                cam_Nd_var=cam_Nd_var,
+                cam_CCN_var=cam_CCN_var,
+                cam_sigmaw_var=cam_sigmaw_var,
+                cam_rain_var=cam_rain_var,
+                cam_rain_threshold=cam_rain_threshold,
+                temp_threshold_K=cam_temp_threshold_K,
+                cam_lwc_var="cam_lwc",
+                lwc_threshold=1e-3,
+                regimes=regimes,
+                cam_regime_map=cam_regime_map,
+                n_bins=n_bins,
+                binning=binning,
+                min_n=min_n,
+            )
+
+            cam_out["case"] = case_name
+
+            cam_outs[case_name] = cam_out
 
     #out = pd.concat([obs_out, cam_out], ignore_index=True) if len(cam_out) else obs_out
 
