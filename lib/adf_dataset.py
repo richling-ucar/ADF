@@ -59,7 +59,7 @@ class AdfData:
     def __init__(self, adfobj):
         self.adf = adfobj  # provides quick access to the AdfDiag object
         # paths
-        self.model_rgrid_loc = adfobj.get_basic_info("cam_regrid_loc", required=True)
+        self.model_rgrid_loc = adfobj.get_basic_info("cam_regrid_loc")
 
         # variables (and info for unit transform)
         # use self.adf.diag_var_list and self.adf.self.adf.variable_defaults
@@ -92,6 +92,8 @@ class AdfData:
             self.ref_labels = {}
             # when using a reference simulation, allow a "special" attribute with the case name:
             self.ref_case_label = self.adf.get_baseline_info("cam_case_name", required=True)
+            if not self.adf.diag_var_list:
+                self.adf.diag_var_list = []
             for v in self.adf.diag_var_list:
                 self.ref_var_nam[v] = v
                 self.ref_labels[v] = self.adf.get_baseline_info("cam_case_name", required=True)
@@ -101,6 +103,8 @@ class AdfData:
 
     def set_ref_var_loc(self):
         """Set reference climo file locations"""
+        if not self.adf.diag_var_list:
+            self.adf.diag_var_list = []
         for v in self.adf.diag_var_list:
             f = self.get_reference_climo_file(v)
             self.ref_var_loc[v] = f

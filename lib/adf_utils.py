@@ -46,6 +46,8 @@ Notes
 """
 
 #import statements:
+import time
+
 import numpy as np
 import xarray as xr
 import pandas as pd
@@ -80,6 +82,25 @@ seasons = {"ANN": np.arange(1,13,1),
 #################
 #HELPER FUNCTIONS
 #################
+
+def timer(msg, start):
+    """Print the seconds since `start` (a time.perf_counter() value) and restart the clock.
+
+    Parameters
+    ----------
+    msg : str
+        Label printed ahead of the elapsed time.
+    start : float
+        A previous ``time.perf_counter()`` reading.
+
+    Returns
+    -------
+    float
+        A fresh ``time.perf_counter()`` reading, to pass as the next `start`.
+    """
+    print(f"{msg}: {time.perf_counter() - start:.2f} s")
+    return time.perf_counter()
+
 
 def load_dataset(fils):
     """

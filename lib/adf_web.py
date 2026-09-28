@@ -141,8 +141,13 @@ class AdfWeb(AdfObs):
         #Loop over model cases and generate relevant website directories:
         for case_idx, case_name in enumerate(case_names):
 
-            #Create new path object from user-specified plot directory path:
-            plot_path = Path(self.plot_location[case_idx])
+            #Create new path object from user-specified plot directory path
+            #(INFORM runs have one plot directory, shared by every case):
+            if self.inform_diags:
+                plot_path = Path(self.plot_location)
+            else:
+                plot_path = Path(self.plot_location[case_idx])
+            #End if
 
             #Create directory path where the website will be built:
             website_dir = plot_path / "website"
@@ -209,14 +214,15 @@ class AdfWeb(AdfObs):
         #Create directory path where the website will be built:
         website_dir = plot_path / "website"
         Path(website_dir).mkdir(parents=True, exist_ok=True)
-        run_info = ""
-        if self.debug_log:
-            log_name = self.debug_fname
-            run_info = f"{log_name}".replace("debug","run_info").replace(".log",".md")
-            self.run_info = run_info
-            self._write_run_info_to_log(config_file, active_env)
+        #Always build the run info: it is meant to help debug the run setup,
+        #whether or not debug logging is on.  (debug_fname is set on every
+        #run; writing to the debug log itself does nothing without --debug.)
+        log_name = self.debug_fname
+        run_info = f"{log_name}".replace("debug","run_info").replace(".log",".md")
+        self.run_info = run_info
+        self._write_run_info_to_log(config_file, active_env)
         #Do nothing if user is not requesting a website to be generated:
-        if self.create_html and self.debug_log:
+        if self.create_html:
             #Write the run info into every website directory this run will build.
             #The content is the same for all of them, but "create_website" reads it
             #back from the directory belonging to each web_data's case -- including
@@ -244,46 +250,46 @@ class AdfWeb(AdfObs):
         """
         four_space = "&nbsp;&nbsp;&nbsp;&nbsp;"
         two_space = "&nbsp;&nbsp;"
-        font_22 = "style='font-size:22px;'"
-        font_18 = "style='font-size:18px;'"
-        font_16 = "style='font-size:16px;'"
+        font22 = "style='font-size:22px;'"
+        font18 = "style='font-size:18px;'"
+        font16 = "style='font-size:16px;'"
 
         with open(run_info, "w") as f:
 
             # Gather config yaml file info
             f.write("<p style=color:black>")
-            f.write(f"<strong><a {font_22}>Config file used</a></strong></u><br>")
-            f.write(f"{two_space}<a {font_16}>{config_file}</a><br><br>")
+            f.write(f"<strong><a {font22}>Config file used</a></strong></u><br>")
+            f.write(f"{two_space}<a {font16}>{config_file}</a><br><br>")
 
-            f.write(f"&nbsp;<u><a {font_18}>Config file options</a></u><br>")
+            f.write(f"&nbsp;<u><a {font18}>Config file options</a></u><br>")
             for key,val in self.config_dict().items():
                 if isinstance(val,dict):
-                    f.write(f"{two_space}<a {font_16}><strong>{key}:</strong></a><br>")
+                    f.write(f"{two_space}<a {font16}><strong>{key}:</strong></a><br>")
                     for key2,val2 in val.items():
-                        f.write(f"{four_space}<a {font_16}><strong>{key2}:</strong> {val2}</a><br>")
+                        f.write(f"{four_space}<a {font16}><strong>{key2}:</strong> {val2}</a><br>")
                 elif isinstance(val,list):
-                    f.write(f"{two_space}<a {font_16}><strong>{key}:</strong></a><br>")
+                    f.write(f"{two_space}<a {font16}><strong>{key}:</strong></a><br>")
                     for val2 in val:
-                        f.write(f"{four_space}<a {font_16}>{val2}</a><br>")
+                        f.write(f"{four_space}<a {font16}>{val2}</a><br>")
                 else:
-                    f.write(f"{two_space}<a {font_16}><strong>{key}:</strong> {val}</a><br>")
+                    f.write(f"{two_space}<a {font16}><strong>{key}:</strong> {val}</a><br>")
 
             # Gather Conda environment
             f.write("\n")
-            f.write(f"<br><strong><a {font_22}>Conda env used</a></strong><br>")
-            f.write(f"<a {font_16}>{two_space}{active_env}</a>")
+            f.write(f"<br><strong><a {font22}>Conda env used</a></strong><br>")
+            f.write(f"<a {font16}>{two_space}{active_env}</a>")
 
             # Gather Git info
             git_info = self.get_git_info()
             if git_info is None:
                 f.write("\n")
-                f.write(f"<br><br><strong><a {font_22}>No git info found</a></strong><br>")
+                f.write(f"<br><br><strong><a {font22}>No git info found</a></strong><br>")
                 f.write("</p>")
             else:
                 f.write("\n")
-                f.write(f"<br><br><strong><a {font_22}>Git Info</a></strong><br>")
+                f.write(f"<br><br><strong><a {font22}>Git Info</a></strong><br>")
                 for key,val in git_info.items():
-                    f.write(f"{two_space}<a {font_16}><strong>{key}:</strong> {val}</a></><br>")
+                    f.write(f"{two_space}<a {font16}><strong>{key}:</strong> {val}</a></><br>")
                 f.write("</p>")
 
     def _write_run_info_to_log(self, config_file, active_env):
@@ -524,7 +530,9 @@ class AdfWeb(AdfObs):
             for web_data in self.__website_data:
                 print(f"OH BOY BIG? {dir(web_data)}")
 
-                print(f"campaign: {web_data.case}\ncase: {web_data.cam_desc}\nplot: {web_data.plot_type}\nurl {str(web_data.data.parts[-1])}") #\nurl: {web_data.web_data}
+                print(f"campaign: {web_data.case}\ncase: {web_data.cam_desc}")
+                print("plot: {web_data.plot_type}")
+                prunt("url {str(web_data.data.parts[-1])}") #\nurl: {web_data.web_data}")
                 manifest.append({
                     "urls": str(web_data.data.parts[-1]),
                     "case": web_data.cam_desc,
@@ -558,7 +566,9 @@ class AdfWeb(AdfObs):
                         "urls": [],
                     }
 
-                url_entry = {"url":str(url), "type":web_data.plot_type, "category":web_data.category}
+                url_entry = {"url":str(url),
+                             "type":web_data.plot_type,
+                             "category":web_data.category}
 
                 #Only add panel/panel_label for plot types that actually use them
                 #(e.g. a multi-panel "summary" image plus its individual component
@@ -597,27 +607,36 @@ class AdfWeb(AdfObs):
             # Interactive Plots tab discovers these dynamically from the
             # manifest's "campaign" values, so no further wiring is needed
             # here beyond writing one page per campaign.
-            with open(jinja_template_dir / 'template_dropsonde.html', 'r', encoding='utf-8') as file:
+            tmp_drop_fil = 'template_dropsonde.html'
+            with open(jinja_template_dir / tmp_drop_fil, 'r', encoding='utf-8') as file:
                 dropsonde_template = file.read()
-            with open(jinja_template_dir / 'template_nd_lwc_pdf.html', 'r', encoding='utf-8') as file:
+            tmp_nd_fil = 'template_nd_lwc_pdf.html'
+            with open(jinja_template_dir / tmp_nd_fil, 'r', encoding='utf-8') as file:
                 nd_lwc_pdf_template = file.read()
-            with open(jinja_template_dir / 'template_sensitivity_vs_sigmaw.html', 'r', encoding='utf-8') as file:
+            tmp_sig_fil = 'template_sensitivity_vs_sigmaw.html'
+            with open(jinja_template_dir / tmp_sig_fil, 'r', encoding='utf-8') as file:
                 sensitivity_template = file.read()
 
             for campaign_name in self.campaigns_dict["name"]:
                 current_json = f"dropsonde_profiles_{campaign_name}_{config_file_name}.json"
-                updated_dropsonde_content = dropsonde_template.replace('sample_dropsonde_profile.json', current_json)
-                with open(website_dir / f'dropsonde_{campaign_name}.html', 'w', encoding='utf-8') as file:
+                tmp_fil = 'sample_dropsonde_profile.json'
+                updated_dropsonde_content = dropsonde_template.replace(tmp_fil, current_json)
+                out_fil = website_dir / f'dropsonde_{campaign_name}.html'
+                with open(out_fil, 'w', encoding='utf-8') as file:
                     file.write(updated_dropsonde_content)
 
                 current_json = f"nd_lwc_pdfs_{campaign_name}_{config_file_name}.json"
-                updated_nd_lwc_pdf_content = nd_lwc_pdf_template.replace('sample_nd_lwc_pdf.json', current_json)
-                with open(website_dir / f'nd_lwc_pdf_{campaign_name}.html', 'w', encoding='utf-8') as file:
+                tmp_fil = 'sample_nd_lwc_pdf.json'
+                updated_nd_lwc_pdf_content = nd_lwc_pdf_template.replace(tmp_fil, current_json)
+                out_fil = website_dir / f'nd_lwc_pdf_{campaign_name}.html'
+                with open(out_fil, 'w', encoding='utf-8') as file:
                     file.write(updated_nd_lwc_pdf_content)
 
                 current_json = f"sensitivity_vs_sigmaw_{campaign_name}_{config_file_name}.json"
-                updated_sensitivity_content = sensitivity_template.replace('sample_sensitivity_vs_sigmaw.json', current_json)
-                with open(website_dir / f'sensitivity_vs_sigmaw_{campaign_name}.html', 'w', encoding='utf-8') as file:
+                tmp_fil = 'sample_sensitivity_vs_sigmaw.json'
+                updated_sensitivity_content = sensitivity_template.replace(tmp_fil, current_json)
+                out_fil = website_dir / f'sensitivity_vs_sigmaw_{campaign_name}.html'
+                with open(out_fil, 'w', encoding='utf-8') as file:
                     file.write(updated_sensitivity_content)
 
             #------------------------------
@@ -654,7 +673,7 @@ class AdfWeb(AdfObs):
                 manifest=manifest
             )
 
-            with open("inform_index.html", "w") as f:
+            with open(website_dir / "inform_index.html", "w", encoding="utf-8") as f:
                 f.write(html)
 
             #Move file to assets directory:
@@ -792,7 +811,8 @@ class AdfWeb(AdfObs):
         for web_data in self.__website_data:
 
             #Create the directory where the website will be built:
-            self.__case_web_paths[web_data.case]['website_dir'].mkdir(exist_ok=True)
+            web_dir = self.__case_web_paths[web_data.case]['website_dir']
+            web_dir.mkdir(exist_ok=True)
 
             #Create a directory where CSS files will be stored:
             css_files_dir = self.__case_web_paths[web_data.case]['css_files_dir']
@@ -1024,11 +1044,11 @@ class AdfWeb(AdfObs):
 
             #Also check if index page exists for this case:
             index_html_file = \
-                self.__case_web_paths[web_data.case]['website_dir'] / "index.html"
+                web_dir / "index.html"
 
             # Create run info web page
             run_info_md_file = \
-                self.__case_web_paths[web_data.case]['website_dir'] / self.run_info
+                web_dir / self.run_info
 
             # Read the markdown file
             with open(run_info_md_file, "r", encoding="utf-8") as mdfile:
@@ -1037,7 +1057,7 @@ class AdfWeb(AdfObs):
             # Convert markdown to HTML
             run_info_html = markdown.markdown(md_text)
             index_title = "CAM Diagnostics"
-            run_info_html_file = self.__case_web_paths[web_data.case]['website_dir'] / "run_info.html"
+            run_info_html_file = web_dir / "run_info.html"
             run_info_tmpl = jinenv.get_template('template_run_info.html')
             run_info_rndr = run_info_tmpl.render(title=index_title,
                                             case_name=web_data.case,
@@ -1062,7 +1082,6 @@ class AdfWeb(AdfObs):
             #Note: this is a copy, as the list is appended to below and
             #"res" is re-used on every pass through this loop:
             avail_plot_types = list(res["default_ptypes"])
-            avail_plot_types = res["default_ptypes"]
 
             #Check if current plot type is in ADF default.
             #If not, add it so the index.html file can include it
