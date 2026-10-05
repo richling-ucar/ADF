@@ -240,10 +240,21 @@
 
   // Fixed color assignment by case, in config order - stable regardless of
   // which checkboxes are on, so a case's identity never repaints.
-  const COLORS = ["var(--slot-1)", "var(--slot-2)", "var(--slot-3)", "var(--slot-4)"];
+  // Every case gets a unique color: the hand-picked palette first, then
+  // golden-angle hues for any cases beyond it (never cycles/repeats).
+  // Black is avoided since it belongs to Obs.
+  const COLORS = [
+    "var(--slot-1)", "var(--slot-2)", "var(--slot-3)", "var(--slot-4)",
+    "#d62728", "#9467bd", "#8c564b", "#e377c2", "#17becf", "#bcbd22",
+  ];
+  const caseColor = i => (i < COLORS.length
+    ? COLORS[i]
+    : d3.hsl((i - COLORS.length) * 137.508 + 15, 0.65, 0.45).formatHex());
+  // All CAM cases are dotted; solid is reserved for Obs.
+  const CASE_DASH = "2,2";
   const style = {};
   caseNames.forEach((name, i) => {
-    style[name] = { color: COLORS[i % COLORS.length] };
+    style[name] = { color: caseColor(i), dash: CASE_DASH };
   });
 
   const refVisible = new Set(REF_NAMES.filter(name => name in data.cases));
@@ -378,13 +389,13 @@
       const ref = REF_NAMES
         .filter(name => refVisible.has(name) && name in data.cases)
         .map(name => ({
-          key: name, label: REF_STYLE[name].label, color: REF_STYLE[name].color,
+          key: name, label: REF_STYLE[name].label, color: REF_STYLE[name].color, dash: "none",
           entry: data.cases[name][regimeKey][drizzleKey],
         }));
       const cam = caseNames
         .filter(name => visible.has(name))
         .map(name => ({
-          key: name, label: name, color: style[name].color,
+          key: name, label: name, color: style[name].color, dash: style[name].dash,
           entry: data.cases[name][regimeKey][drizzleKey],
         }));
       return [...ref, ...cam];
@@ -398,6 +409,7 @@
         .join("path")
         .attr("class", "fit-line")
         .attr("stroke", d => d.color)
+        .attr("stroke-dasharray", d => (d.dash === "none" ? null : d.dash))
         .attr("d", d => lineGen(fitLinePoints(d.entry)));
 
       const dotData = active.flatMap(d =>

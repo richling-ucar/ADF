@@ -275,14 +275,26 @@
     ERA5: { label: "ERA5",            color: "#888888", dash: "5,3",  band: false },
   };
 
-  // Fixed color/dash assignment by case, in config order - stable regardless
+  // Fixed color assignment by case, in config order - stable regardless
   // of which checkboxes are on, so a case's identity never repaints.
-  const COLORS = ["var(--slot-1)", "var(--slot-2)", "var(--slot-3)", "var(--slot-4)"];
-  const DASH   = ["none", "6,3", "2,2", "9,3,2,3"]; // solid, dashed, dotted, dash-dot
+  // Every case gets a unique color: the hand-picked palette first, then
+  // golden-angle hues for any cases beyond it (never cycles/repeats).
+  // Black and grey are avoided since they belong to Obs and ERA5.
+  const COLORS = [
+    "var(--slot-1)", "var(--slot-2)", "var(--slot-3)", "var(--slot-4)",
+    "#d62728", "#9467bd", "#8c564b", "#e377c2", "#17becf", "#bcbd22",
+  ];
+  const caseColor = i => (i < COLORS.length
+    ? COLORS[i]
+    : d3.hsl((i - COLORS.length) * 137.508 + 15, 0.65, 0.45).formatHex());
+  // All CAM cases are dotted; solid/dashed are reserved for Obs/ERA5.
+  const CASE_DASH = "2,2";
   const style = {};
   caseNames.forEach((name, i) => {
-    style[name] = { color: COLORS[i % COLORS.length], dash: DASH[i % DASH.length] };
+    style[name] = { color: caseColor(i), dash: CASE_DASH };
   });
+  // Legend/tooltip swatch border style matching a series' dash pattern.
+  const swatchStyle = dash => (dash === "none" ? "solid" : dash === CASE_DASH ? "dotted" : "dashed");
 
   const refVisible = new Set(REF_NAMES.filter(name => name in data.cases));
   const visible = new Set(caseNames);
@@ -311,7 +323,7 @@
     });
   refRows.append("span")
     .attr("class", "case-swatch")
-    .style("border-top-style", name => (REF_STYLE[name].dash === "none" ? "solid" : "dashed"));
+    .style("border-top-style", name => swatchStyle(REF_STYLE[name].dash));
   refRows.append("span").attr("class", "case-name").text(name => REF_STYLE[name].label);
   refRows.append("span").attr("class", "case-n")
     .text(name => (data.cases[name].N_open != null ? `n=${data.cases[name].N_open}/${data.cases[name].N_strat}` : ""));
@@ -332,7 +344,7 @@
     });
   rows.append("span")
     .attr("class", "case-swatch")
-    .style("border-top-style", name => (style[name].dash === "none" ? "solid" : "dashed"));
+    .style("border-top-style", name => swatchStyle(style[name].dash));
   rows.append("span").attr("class", "case-name").text(name => name);
 
   // --- shared scales across both panels and all series, so everything is
@@ -509,7 +521,7 @@
           const row = tooltip.append("div").attr("class", "t-row");
           row.append("span").attr("class", "t-key")
             .style("border-top-color", r.color)
-            .style("border-top-style", r.dash === "none" ? "solid" : "dashed");
+            .style("border-top-style", swatchStyle(r.dash));
           row.append("span").attr("class", "t-name").text(r.label);
           row.append("span").attr("class", "t-val").text(`${r.pt.mean.toFixed(1)}% ± ${r.pt.std.toFixed(1)}`);
         });
@@ -621,7 +633,7 @@
           const row = tooltip.append("div").attr("class", "t-row");
           row.append("span").attr("class", "t-key")
             .style("border-top-color", r.color)
-            .style("border-top-style", r.dash === "none" ? "solid" : "dashed");
+            .style("border-top-style", swatchStyle(r.dash));
           row.append("span").attr("class", "t-name").text(r.label);
           row.append("span").attr("class", "t-val").text(`${r.pt.delta >= 0 ? "+" : ""}${r.pt.delta.toFixed(1)}%`);
         });
