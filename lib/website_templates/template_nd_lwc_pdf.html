@@ -34,7 +34,34 @@
   }
   .wrap { max-width: 1080px; margin: 0 auto; }
 
-  .header { margin-bottom: 12px; }
+  .header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+  /* Save PNG / Save SVG buttons in the header (see "Save figure" in the
+     script) - same quiet look as the band toggle so they don't dominate. */
+  .header-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: none;
+    padding-top: 2px;
+  }
+  .export-btn {
+    font: inherit;
+    font-size: 12px;
+    padding: 3px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface-1);
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+  .export-btn:hover { color: var(--text-primary); border-color: var(--baseline); }
+  .export-btn:disabled { opacity: 0.5; cursor: progress; }
   h1 { font-size: 16px; font-weight: 600; margin: 0; }
   .subtitle { font-size: 12px; color: var(--text-secondary); margin: 2px 0 0; }
 
@@ -153,8 +180,14 @@
 
 <div class="wrap">
   <div class="header">
-    <h1>Nd / LWC probability distributions</h1>
-    <div class="subtitle" id="subtitle">Cloud droplet number and liquid water content, by cloud regime</div>
+    <div>
+      <h1>Nd / LWC probability distributions</h1>
+      <div class="subtitle" id="subtitle">Cloud droplet number and liquid water content, by cloud regime</div>
+    </div>
+    <div class="header-controls">
+      <button type="button" class="export-btn" id="save-png">Save PNG</button>
+      <button type="button" class="export-btn" id="save-svg">Save SVG</button>
+    </div>
   </div>
 
   <div class="picker-group">
@@ -450,6 +483,221 @@
   const renderStratNd  = buildPanel("#chart-strat-nd",  "strat", "Nd",  ndScales,  ndFormat);
   const renderStratLwc = buildPanel("#chart-strat-lwc", "strat", "LWC", lwcScales, lwcFormat);
   function renderAll() { renderOpenNd(); renderOpenLwc(); renderStratNd(); renderStratLwc(); }
+
+  // Legend for the saved figure: visible reference series, then visible cases.
+  const EXPORT_NAME = "nd_lwc_pdfs";
+  function exportLegendItems() {
+    const refs = REF_NAMES
+      .filter(name => refVisible.has(name) && name in data.cases)
+      .map(name => ({ label: REF_STYLE[name].label, color: REF_STYLE[name].color, dash: REF_STYLE[name].dash }));
+    const cases = caseNames
+      .filter(name => visible.has(name))
+      .map(name => ({ label: name, color: style[name].color, dash: style[name].dash }));
+    return [...refs, ...cases];
+  }
+
+  // --- Save figure (PNG / SVG) ---
+  // Builds one standalone SVG of what's currently shown: page title, every
+  // panel in its on-screen 2-column order, and a legend of the visible
+  // series. Each panel's <svg> is cloned with its computed styles inlined,
+  // because a serialized SVG no longer sees this page's stylesheet or CSS
+  // variables (e.g. var(--slot-1) colors, .line { fill: none }, hidden axis
+  // domain paths). The PNG is that same SVG rasterized onto a canvas.
+  const EXPORT_STYLE_PROPS = [
+    "fill", "fill-opacity", "stroke", "stroke-width", "stroke-dasharray",
+    "stroke-opacity", "opacity", "font-family", "font-size", "font-weight",
+    "shape-rendering",
+  ];
+  const EXPORT_PNG_SCALE = 3;
+  const EXPORT_FONT = getComputedStyle(document.body).fontFamily;
+  const measureCtx = document.createElement("canvas").getContext("2d");
+  function textWidth(text, size) {
+    measureCtx.font = `${size}px ${EXPORT_FONT}`;
+    return measureCtx.measureText(text).width;
+  }
+  // Resolve any CSS color (incl. "var(--slot-1)") to a literal rgb() value.
+  function resolveColor(color) {
+    const probe = document.body.appendChild(document.createElement("span"));
+    probe.style.color = color;
+    const resolved = getComputedStyle(probe).color;
+    probe.remove();
+    return resolved;
+  }
+
+  function cloneWithInlineStyles(src) {
+    const dst = src.cloneNode(true);
+    const drop = [];
+    (function walk(s, d) {
+      const cs = getComputedStyle(s);
+      if (cs.display === "none" || s.classList.contains("hover-layer")) { drop.push(d); return; }
+      for (const prop of EXPORT_STYLE_PROPS) d.style.setProperty(prop, cs.getPropertyValue(prop));
+      for (let i = 0; i < s.children.length; i++) walk(s.children[i], d.children[i]);
+    })(src, dst);
+    drop.forEach(node => node.remove());
+    return dst;
+  }
+
+  function buildExportSvg() {
+    const PAD = 20, GAP_X = 24, GAP_Y = 18, COLS = 2;
+    const TEXT = resolveColor("var(--text-primary)");
+    const TEXT_2 = resolveColor("var(--text-secondary)");
+    const TEXT_3 = resolveColor("var(--text-muted)");
+
+    const panels = [...document.querySelectorAll(".chart-card")].map(card => {
+      const svg = card.querySelector("svg");
+      const vb = svg.viewBox.baseVal;
+      // On-screen hints (data-export="false") are left out of the saved figure.
+      const sub = card.querySelector('.chart-sub:not([data-export="false"])');
+      const stats = [...card.querySelectorAll(".stat-row")].map(row => ({
+        color: getComputedStyle(row.querySelector(".stat-dot")).backgroundColor,
+        name: row.querySelector(".stat-name").textContent,
+        val: row.querySelector(".stat-val").textContent,
+      }));
+      const headH = 18 + (sub ? 15 : 0) + 4;
+      return {
+        svg, w: vb.width, h: vb.height, headH, stats,
+        title: card.querySelector("h2").textContent.trim(),
+        sub: sub ? sub.textContent.trim() : "",
+        blockH: headH + vb.height + (stats.length ? 8 + stats.length * 15 : 0),
+      };
+    });
+
+    const panelW = d3.max(panels, p => p.w);
+    const totalW = PAD * 2 + COLS * panelW + (COLS - 1) * GAP_X;
+
+    // Legend entries flow left-to-right, wrapping at the figure width.
+    const legend = exportLegendItems().map(item => ({ ...item, color: resolveColor(item.color) }));
+    const SAMPLE_W = 26, ITEM_GAP = 18, ROW_H = 18;
+    let lx = PAD, ly = 0;
+    legend.forEach(item => {
+      const w = SAMPLE_W + 6 + textWidth(item.label, 11);
+      if (lx > PAD && lx + w > totalW - PAD) { lx = PAD; ly += ROW_H; }
+      item.x = lx; item.y = ly;
+      lx += w + ITEM_GAP;
+    });
+    const legendH = legend.length ? ly + ROW_H : 0;
+
+    const headerH = 66;
+    const rowHeights = d3.range(Math.ceil(panels.length / COLS)).map(r =>
+      d3.max(panels.slice(r * COLS, r * COLS + COLS), p => p.blockH));
+    const panelsH = d3.sum(rowHeights) + GAP_Y * (rowHeights.length - 1);
+    const totalH = headerH + panelsH + (legendH ? GAP_Y + legendH : 0) + PAD;
+
+    const out = d3.create("svg")
+      .attr("xmlns", "http://www.w3.org/2000/svg")
+      .attr("width", totalW).attr("height", totalH)
+      .attr("viewBox", `0 0 ${totalW} ${totalH}`)
+      .style("font-family", EXPORT_FONT);
+    out.append("rect").attr("width", totalW).attr("height", totalH).attr("fill", "#ffffff");
+
+    out.append("text").attr("x", PAD).attr("y", PAD + 12)
+      .attr("fill", TEXT).style("font-size", "16px").style("font-weight", 600)
+      .text(document.querySelector("h1").textContent.trim());
+    out.append("text").attr("x", PAD).attr("y", PAD + 30)
+      .attr("fill", TEXT_2).style("font-size", "12px")
+      .text(document.querySelector("#subtitle").textContent.trim());
+
+    let rowTop = headerH;
+    rowHeights.forEach((rowH, r) => {
+      panels.slice(r * COLS, r * COLS + COLS).forEach((p, c) => {
+        const px = PAD + c * (panelW + GAP_X);
+        const g = out.append("g").attr("transform", `translate(${px},${rowTop})`);
+        g.append("text").attr("y", 13).attr("fill", TEXT)
+          .style("font-size", "13px").style("font-weight", 600).text(p.title);
+        if (p.sub) {
+          g.append("text").attr("y", 28).attr("fill", TEXT_3).style("font-size", "11px").text(p.sub);
+        }
+        const clone = cloneWithInlineStyles(p.svg);
+        clone.setAttribute("x", 0);
+        clone.setAttribute("y", p.headH);
+        clone.setAttribute("width", p.w);
+        clone.setAttribute("height", p.h);
+        clone.setAttribute("overflow", "visible");
+        clone.removeAttribute("style");
+        g.append(() => clone);
+        p.stats.forEach((s, i) => {
+          const sy = p.headH + p.h + 8 + i * 15 + 11;
+          g.append("circle").attr("cx", 4).attr("cy", sy - 4).attr("r", 4).attr("fill", s.color);
+          g.append("text").attr("x", 14).attr("y", sy).attr("fill", TEXT_2)
+            .style("font-size", "11px").text(s.name);
+          g.append("text").attr("x", p.w).attr("y", sy).attr("text-anchor", "end").attr("fill", TEXT)
+            .style("font-size", "11px").style("white-space", "pre").text(s.val);
+        });
+      });
+      rowTop += rowH + GAP_Y;
+    });
+
+    const legendTop = headerH + panelsH + GAP_Y;
+    const gLegend = out.append("g").attr("transform", `translate(0,${legendTop})`);
+    legend.forEach(item => {
+      const cy = item.y + ROW_H / 2;
+      gLegend.append("line")
+        .attr("x1", item.x).attr("x2", item.x + SAMPLE_W).attr("y1", cy).attr("y2", cy)
+        .attr("stroke", item.color).attr("stroke-width", 2)
+        .attr("stroke-dasharray", item.dash === "none" ? null : item.dash);
+      if (item.marker) {
+        gLegend.append("circle").attr("cx", item.x + SAMPLE_W / 2).attr("cy", cy).attr("r", 3.5)
+          .attr("fill", item.color).attr("stroke", "#ffffff").attr("stroke-width", 1);
+      }
+      gLegend.append("text").attr("x", item.x + SAMPLE_W + 6).attr("y", cy + 4)
+        .attr("fill", TEXT_2).style("font-size", "11px").text(item.label);
+    });
+
+    return { node: out.node(), width: totalW, height: totalH };
+  }
+
+  function exportFileBase() {
+    return `${EXPORT_NAME}_${data.campaign}`.replace(/[^\w.-]+/g, "_");
+  }
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  function serializeSvg(node) {
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + new XMLSerializer().serializeToString(node);
+  }
+  async function saveSVG() {
+    const { node } = buildExportSvg();
+    downloadBlob(new Blob([serializeSvg(node)], { type: "image/svg+xml;charset=utf-8" }), `${exportFileBase()}.svg`);
+  }
+  async function savePNG() {
+    const { node, width, height } = buildExportSvg();
+    const img = new Image();
+    img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(serializeSvg(node));
+    await img.decode();
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(width * EXPORT_PNG_SCALE);
+    canvas.height = Math.round(height * EXPORT_PNG_SCALE);
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/png"));
+    downloadBlob(blob, `${exportFileBase()}.png`);
+  }
+  function wireExportButton(id, save) {
+    const button = document.getElementById(id);
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        await save();
+      } catch (err) {
+        console.error("Could not save figure:", err);
+        alert("Could not save figure.");
+      } finally {
+        button.disabled = false;
+      }
+    });
+  }
+  wireExportButton("save-png", savePNG);
+  wireExportButton("save-svg", saveSVG);
+
   renderAll();
 })();
 </script>

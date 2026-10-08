@@ -112,6 +112,10 @@ class AdfWeb(AdfObs):
         #Initialize website mean plots dictionary:
         self.__website_data = []
 
+        #INFORM interactive (D3) pages whose combined JSON this run wrote,
+        #{(campaign, page): JSON file name}; see add_inform_page:
+        self.__inform_pages = {}
+
         #Initialize website plot type order lists:
         self.__plot_type_order = []
 
@@ -338,6 +342,17 @@ class AdfWeb(AdfObs):
                 log_msg += f"  {key}: {val}\n"
 
         self.debug_log(log_msg)
+
+    def add_inform_page(self, campaign, page, json_path):
+        """
+        Record that this run wrote the combined JSON for one INFORM
+        interactive page, so create_website builds that page (and the
+        dashboard shows its tab) only when its data is from this run.
+
+        page is the page's file prefix: "dropsonde", "nd_lwc_pdf" or
+        "sensitivity_vs_sigmaw".
+        """
+        self.__inform_pages[(campaign, page)] = Path(json_path).name
 
     def add_website_data(self, web_data, web_name, case_name,
                          category = None,
@@ -582,6 +597,12 @@ class AdfWeb(AdfObs):
 
             manifest = list(manifest_dict.values())
 
+            #Each entry lists its campaign's interactive pages with data from
+            #this run, so the dashboard only shows tabs for pages that exist:
+            for entry in manifest:
+                entry["interactive"] = sorted(page for (campaign, page) in self.__inform_pages
+                                              if campaign == entry["campaign"])
+
             config_file_name = self.config_file_dict["name"]
             current_man = f"manifest_{config_file_name}.json"
 
@@ -597,47 +618,30 @@ class AdfWeb(AdfObs):
 
             # Build out INFORM D3 web data plot pages and Dashboard
             #------------------------------------------------------
-            # Build one Dropsonde + one Nd-LWC PDF + one Sensitivity vs
-            # Sigma W interactive page PER CAMPAIGN, matching
-            # cam_obs_dropsonde_comp.py/cam_obs_nd_lwc_pdf.py/
-            # sensitivity_vs_sigmaw_2x2_obs_cam.py's per-campaign JSON naming
-            # (dropsonde_profiles_{campaign}_{config}.json,
-            # nd_lwc_pdfs_{campaign}_{config}.json,
-            # sensitivity_vs_sigmaw_{campaign}_{config}.json). The dashboard's
-            # Interactive Plots tab discovers these dynamically from the
-            # manifest's "campaign" values, so no further wiring is needed
-            # here beyond writing one page per campaign.
-            tmp_drop_fil = 'template_dropsonde.html'
-            with open(jinja_template_dir / tmp_drop_fil, 'r', encoding='utf-8') as file:
-                dropsonde_template = file.read()
-            tmp_nd_fil = 'template_nd_lwc_pdf.html'
-            with open(jinja_template_dir / tmp_nd_fil, 'r', encoding='utf-8') as file:
-                nd_lwc_pdf_template = file.read()
-            tmp_sig_fil = 'template_sensitivity_vs_sigmaw.html'
-            with open(jinja_template_dir / tmp_sig_fil, 'r', encoding='utf-8') as file:
-                sensitivity_template = file.read()
-
+            # One interactive page per (campaign, diagnostic) whose combined
+            # JSON this run wrote (registered by the diagnostics through
+            # add_inform_page), pointed at that JSON. A page with no data
+            # from this run is removed, so a page left by an earlier run in
+            # this directory can't show old results; its tab is left out of
+            # the dashboard through the manifest's "interactive" lists.
+            inform_templates = {
+                # page file prefix: (template, sample JSON name it references)
+                "dropsonde": ("template_dropsonde.html", "sample_dropsonde_profile.json"),
+                "nd_lwc_pdf": ("template_nd_lwc_pdf.html", "sample_nd_lwc_pdf.json"),
+                "sensitivity_vs_sigmaw": ("template_sensitivity_vs_sigmaw.html",
+                                          "sample_sensitivity_vs_sigmaw.json"),
+            }
             for campaign_name in self.campaigns_dict["name"]:
-                current_json = f"dropsonde_profiles_{campaign_name}_{config_file_name}.json"
-                tmp_fil = 'sample_dropsonde_profile.json'
-                updated_dropsonde_content = dropsonde_template.replace(tmp_fil, current_json)
-                out_fil = website_dir / f'dropsonde_{campaign_name}.html'
-                with open(out_fil, 'w', encoding='utf-8') as file:
-                    file.write(updated_dropsonde_content)
-
-                current_json = f"nd_lwc_pdfs_{campaign_name}_{config_file_name}.json"
-                tmp_fil = 'sample_nd_lwc_pdf.json'
-                updated_nd_lwc_pdf_content = nd_lwc_pdf_template.replace(tmp_fil, current_json)
-                out_fil = website_dir / f'nd_lwc_pdf_{campaign_name}.html'
-                with open(out_fil, 'w', encoding='utf-8') as file:
-                    file.write(updated_nd_lwc_pdf_content)
-
-                current_json = f"sensitivity_vs_sigmaw_{campaign_name}_{config_file_name}.json"
-                tmp_fil = 'sample_sensitivity_vs_sigmaw.json'
-                updated_sensitivity_content = sensitivity_template.replace(tmp_fil, current_json)
-                out_fil = website_dir / f'sensitivity_vs_sigmaw_{campaign_name}.html'
-                with open(out_fil, 'w', encoding='utf-8') as file:
-                    file.write(updated_sensitivity_content)
+                for page, (template_fil, sample_json) in inform_templates.items():
+                    out_fil = website_dir / f'{page}_{campaign_name}.html'
+                    current_json = self.__inform_pages.get((campaign_name, page))
+                    if current_json is None:
+                        out_fil.unlink(missing_ok=True)
+                        continue
+                    with open(jinja_template_dir / template_fil, 'r', encoding='utf-8') as file:
+                        page_content = file.read()
+                    with open(out_fil, 'w', encoding='utf-8') as file:
+                        file.write(page_content.replace(sample_json, current_json))
 
             #------------------------------
 
