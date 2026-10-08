@@ -94,6 +94,10 @@ def save_sensitivity_dashboard_json(campaign, sources, out_dir, config_name):
     expects (see lib/website_templates/examples/sample_sensitivity_vs_sigmaw.json):
     "Obs" is a peer of the CAM cases under "cases", not duplicated inside
     every CAM case.
+
+    The "dashboard" in the name keeps it distinct from the per-source files
+    (sensitivity_vs_sigmaw_{campaign}_{name}.json): a case nickname equal to
+    the config name would otherwise overwrite this file.
     """
     dashboard_json = {
         "campaign": campaign,
@@ -103,10 +107,11 @@ def save_sensitivity_dashboard_json(campaign, sources, out_dir, config_name):
         },
     }
 
-    out_path = Path(out_dir) / f"sensitivity_vs_sigmaw_{campaign}_{config_name}.json"
+    out_path = Path(out_dir) / f"sensitivity_vs_sigmaw_dashboard_{campaign}_{config_name}.json"
     with open(out_path, "w") as f:
         json.dump(dashboard_json, f, indent=2)
     print(f"Wrote sensitivity dashboard JSON: {out_path}")
+    return out_path
 
 
 def compute_obs_sensitivity_stats(All_rf_df, Nd_col, CCN_col, lwc_col, sigmaw_col,
@@ -189,26 +194,22 @@ COMPUTE_KWARGS = dict(
 )
 
 
-def load_sensitivity_sources(adf, All_rf_df, ds_cams, campaign):
+# Bump when compute_obs_sensitivity_stats/compute_case_sensitivity_stats
+# change what they compute, so results cached by older code are recomputed
+# (see cdog.cached_source).
+CACHE_VERSION = 1
+
+
+def load_sensitivity_sources(adf, All_rf_df, ds_cams, campaign, case_info=None):
     """
     Return the per-source sensitivity tables, {"Obs": df, <case>: df, ...},
-    from the pickle cache, computing (and caching) only what is missing.
+    from the cache, computing (and caching) only what is missing.
 
     `ds_cams` is only indexed for cases not already cached, so with a warm
     cache no CAM data is read; likewise `All_rf_df` is only used when "Obs"
-    is missing.
+    is missing. `case_info` ({case nickname: case details} from
+    inform_model_analysis) keys each case's cache file by its full case name.
     """
-    plot_loc = Path(adf.plot_location)
-    yup = Path(adf.config_file_dict["name"])
-    # pkl cache and JSON exports live alongside the dashboard/html files
-    # (created already by AdfWeb.__init__, but mkdir here too to be safe):
-    website_dir = plot_loc / "website"
-    website_dir.mkdir(parents=True, exist_ok=True)
-    # Qualified by campaign so a config listing multiple campaigns (e.g.
-    # SOCRATES + CSET) doesn't have the second campaign's cases collide
-    # with, or get mistaken for already-cached, the first's:
-    data_pkl = website_dir / f"sensitivity_vs_sigmaw_{campaign}_{yup}.pkl"
-
     obs_kwargs = {k: COMPUTE_KWARGS[k] for k in (
         "Nd_col", "CCN_col", "lwc_col", "sigmaw_col", "regime_col", "Ndriz_col",
         "drizzle_threshold", "n_bins", "binning", "min_n",
@@ -218,35 +219,31 @@ def load_sensitivity_sources(adf, All_rf_df, ds_cams, campaign):
         "cam_temp_threshold_K", "cam_regime_map", "n_bins", "binning", "min_n",
     )}
 
-    # safe_pickle_load tolerates a missing OR corrupted file (e.g. left
-    # truncated by a previous run that got interrupted mid-write) by
-    # just returning {}, so this one call covers "no cache yet" too:
-    enough_sens = cdog.safe_pickle_load(data_pkl) if data_pkl.is_file() else {}
+    # One cache file per source ("Obs" and each case, keyed by full case
+    # name), checked against a fingerprint of everything the result depends
+    # on (cdog.cached_source):
+    cache_root = cdog.inform_cache_root(adf, campaign)
 
-    if "Obs" not in enough_sens:
-        print(f"'Obs' missing from {data_pkl}, computing it.")
-        enough_sens["Obs"] = compute_obs_sensitivity_stats(All_rf_df, **obs_kwargs)
-        cdog.atomic_pickle_dump(enough_sens, data_pkl)
-
-    # Check for any cases not already present in the cache - covers both
-    # a brand new cache (every case missing) and one only partially
-    # filled by a prior, interrupted run (just the remaining cases):
-    missing_cases = [case for case in ds_cams if case not in enough_sens]
-    if missing_cases:
-        print(f"Found new case(s) not in {data_pkl}: {missing_cases}")
-        for case in missing_cases:
-            enough_sens[case] = compute_case_sensitivity_stats(case, ds_cams[case], **cam_kwargs)
-
-            # Persist after every case, not just once at the end, so an
-            # interrupted run actually resumes from here next time
-            # instead of silently redoing every case from scratch:
-            cdog.atomic_pickle_dump(enough_sens, data_pkl)
+    enough_sens = {"Obs": cdog.cached_source(
+        cache_root, "sensitivity_vs_sigmaw", campaign, "Obs", cdog.obs_cache_source(All_rf_df),
+        obs_kwargs, CACHE_VERSION,
+        compute=lambda: compute_obs_sensitivity_stats(All_rf_df, **obs_kwargs))}
+    for case in ds_cams:
+        key, source = cdog.case_cache_source(case_info, case)
+        enough_sens[case] = cdog.cached_source(
+            cache_root, "sensitivity_vs_sigmaw", campaign, key, source, cam_kwargs, CACHE_VERSION,
+            compute=lambda case=case: compute_case_sensitivity_stats(case, ds_cams[case], **cam_kwargs),
+            label=case)
+        # The table's "case" column holds the nickname it was computed under,
+        # which another config sharing this cache may have named differently:
+        if len(enough_sens[case]) and "case" in enough_sens[case]:
+            enough_sens[case] = enough_sens[case].assign(case=case)
 
     return enough_sens
 
 
 #cloud regimes
-def sensitivity_vs_sigmaw_2x2_obs_cam(adf, All_rf_df, ds_cams, campaign):
+def sensitivity_vs_sigmaw_2x2_obs_cam(adf, All_rf_df, ds_cams, campaign, case_info=None):
     # Example usage of the microphysics processes plotting function
     # Adjust the variable names and datasets as needed
 
@@ -256,16 +253,21 @@ def sensitivity_vs_sigmaw_2x2_obs_cam(adf, All_rf_df, ds_cams, campaign):
 
     plot_loc = Path(adf.plot_location)
     yup = Path(adf.config_file_dict["name"])
+    # JSON exports live alongside the dashboard/html files
+    # (created already by AdfWeb.__init__, but mkdir here too to be safe):
     website_dir = plot_loc / "website"
+    website_dir.mkdir(parents=True, exist_ok=True)
 
-    enough_sens = load_sensitivity_sources(adf, All_rf_df, ds_cams, campaign)
+    enough_sens = load_sensitivity_sources(adf, All_rf_df, ds_cams, campaign, case_info)
 
     # JSON exports: one file per named source (Obs + each CAM case), plus a
     # single combined file for the D3 dashboard.
     for name, out_df in enough_sens.items():
         if len(out_df):
             save_named_sensitivity_json(name, campaign, website_dir, out_df)
-    save_sensitivity_dashboard_json(campaign, enough_sens, website_dir, yup)
+    dashboard_json = save_sensitivity_dashboard_json(campaign, enough_sens, website_dir, yup)
+    # So the website builds this campaign's interactive sensitivity page:
+    adf.add_inform_page(campaign, "sensitivity_vs_sigmaw", dashboard_json)
 
     # Skip plot generation entirely when the config has create_html turned
     # off - the pkl cache and JSON exports above are already written

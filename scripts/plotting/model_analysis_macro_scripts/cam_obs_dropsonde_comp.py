@@ -143,138 +143,122 @@ def save_dropsonde_dashboard_json(campaign, sonde_var, enough, out_dir, config_n
     with open(out_path, "w") as f:
         json.dump(dashboard_json, f, indent=2)
     print(f"Wrote dropsonde dashboard JSON: {out_path}")
+    return out_path
 
 
-def compute_case_stats(case, campaign, out_dir, ds_out, ds_era5, df_sonde, sonde_var, cam_var, era_var):
+REGIMES = {"open": "Open-Cell", "strat": "Stratocumulus"}
+
+
+def compute_reference_stats(ds_era5, df_sonde, sonde_var, era_var):
     """
-    Collocate model/obs profiles for a single case and return its "enough" entry.
+    Obs (sonde) and ERA5 profiles for both regimes. These don't depend on the
+    CAM case, so the diagnostic computes and caches them once per campaign.
     """
-    # start from your open_mfdataset outputs
-    ds_cam_sub = ds_out[[cam_var]].chunk({"time": -1, "lev": -1}).persist()
     ds_era = ds_era5[[era_var]].chunk({"time": -1, "level": -1}).persist()
-
-    ### --- Open-Cell regime ---
-    t0 = time.perf_counter()
-    df_open, p_cam_open_raw, cam_arr_open, p_era_open_raw, era_arr_open = cdog.collocate_model_profiles_for_regime(
-            df_sonde,
-            ds_cam_sub, # CAM
-            ds_era,     # ERA5
-            regime_name="Open-Cell",
-            sonde_var=sonde_var,
-            cam_var=cam_var,
-            era_var=era_var,
-            cam_lat_name="lat",
-            cam_lon_name="lon",
-            cam_lev_name="lev",
-            era_lat_name="latitude",
-            era_lon_name="longitude",
-            era_lev_name="level",
-            to_percent_models=True,
+    ref = {}
+    for key, regime in REGIMES.items():
+        df_reg, p_era_raw, era_arr = cdog.collocate_profiles_for_regime(
+            df_sonde, ds_era, regime, var=era_var,
+            lat_name="latitude", lon_name="longitude", lev_name="level",
+            to_percent=True, label="ERA5",
         )
-    t0 = utils.timer("loaded OPEN collocate_model_profiles_for_regime", t0)
-    print("type(df_open",type(df_open))
-    print("type(p_cam_open_raw",type(p_cam_open_raw))
+        prof_sonde = cdog.sonde_profile(df_reg, sonde_var, bin_hPa=10, to_percent=True)
+        ref[f"p_sonde_{key}"] = prof_sonde["p_hPa"].values
+        ref[f"sonde_{key}_mean"] = prof_sonde["mean"].values
+        ref[f"sonde_{key}_std"] = prof_sonde["std"].values
+        (ref[f"p_era_{key}"], ref[f"era_{key}_mean"],
+         ref[f"era_{key}_std"]) = cdog.mean_std_from_profiles(p_era_raw, era_arr)
+        # Counts of physical drops (RF, drop_num) in this regime
+        ref[f"N_{key}"] = df_reg.groupby(["RF", "drop_num"]).ngroups
+    return ref
 
-    disk_size(p_cam_open_raw, 'p_cam_open_raw')
 
-    disk_size(p_era_open_raw, 'p_era_open_raw')
-
-    t0 = time.perf_counter()
-    prof_sonde_open = cdog.sonde_profile(df_open, sonde_var, bin_hPa=10, to_percent=True)
-    print("type(prof_sonde_open",type(prof_sonde_open))
-    t0 = utils.timer("loaded OPEN sonde_profile", t0)
-    disk_size(prof_sonde_open, 'prof_sonde_open')
-    p_sonde_open    = prof_sonde_open["p_hPa"].values
-    sonde_open_mean = prof_sonde_open["mean"].values
-    sonde_open_std  = prof_sonde_open["std"].values
-
-    p_cam_open, cam_open_mean, cam_open_std = cdog.mean_std_from_profiles(
-            p_cam_open_raw, cam_arr_open
+def compute_cam_stats(ds_out, df_sonde, cam_var):
+    """One CAM case's profiles at the sondes, for both regimes."""
+    ds_cam_sub = ds_out[[cam_var]].chunk({"time": -1, "lev": -1}).persist()
+    cam = {}
+    for key, regime in REGIMES.items():
+        _, p_cam_raw, cam_arr = cdog.collocate_profiles_for_regime(
+            df_sonde, ds_cam_sub, regime, var=cam_var,
+            lat_name="lat", lon_name="lon", lev_name="lev",
+            to_percent=True, label="CAM",
         )
-    p_era_open, era_open_mean, era_open_std = cdog.mean_std_from_profiles(
-            p_era_open_raw, era_arr_open
-        )
-    print("type(p_cam_open",type(p_cam_open))
-    ### --- Stratocumulus regime ---
-    df_strat, p_cam_strat_raw, cam_arr_strat, p_era_strat_raw, era_arr_strat = cdog.collocate_model_profiles_for_regime(
-            df_sonde,
-            ds_cam_sub,
-            ds_era,
-            regime_name="Stratocumulus",
-            sonde_var=sonde_var,
-            cam_var=cam_var,
-            era_var=era_var,
-            cam_lat_name="lat",
-            cam_lon_name="lon",
-            cam_lev_name="lev",
-            era_lat_name="latitude",
-            era_lon_name="longitude",
-            era_lev_name="level",
-            to_percent_models=True,
-        )
-
-    t0 = time.perf_counter()
-    prof_sonde_strat = cdog.sonde_profile(df_strat, sonde_var, bin_hPa=10, to_percent=True)
-    t0 = utils.timer("loaded STRATOCUMULUS sonde_profile", t0)
-    p_sonde_strat    = prof_sonde_strat["p_hPa"].values
-    sonde_strat_mean = prof_sonde_strat["mean"].values
-    sonde_strat_std  = prof_sonde_strat["std"].values
-
-    p_cam_strat, cam_strat_mean, cam_strat_std = cdog.mean_std_from_profiles(
-            p_cam_strat_raw, cam_arr_strat
-        )
-    p_era_strat, era_strat_mean, era_strat_std = cdog.mean_std_from_profiles(
-            p_era_strat_raw, era_arr_strat
-        )
-
-    # Separate dropsondes based on cloud regime
-    # --- Counts of physical drops (RF, drop_num) in each regime ---
-    N_open  = df_open.groupby(["RF", "drop_num"]).ngroups
-    N_strat = df_strat.groupby(["RF", "drop_num"]).ngroups
-
-    # Bias vs Obs (CAM - Obs), same calculation the Python plotting side
-    # does (draw_open_bias/draw_strat_bias in lib/cam_diagnostic.py):
-    # interpolate this case's own collocated Obs onto its own CAM pressure
-    # grid, then subtract. Computed here (not in JS) so the D3 dashboard
-    # just reads the result instead of recomputing it client-side.
-    obs_open_interp = np.interp(
-            p_cam_open[::-1], p_sonde_open[::-1], sonde_open_mean[::-1],
-        )[::-1]
-    delta_open = cam_open_mean - obs_open_interp
-
-    obs_strat_interp = np.interp(
-            p_cam_strat[::-1], p_sonde_strat[::-1], sonde_strat_mean[::-1],
-        )[::-1]
-    delta_strat = cam_strat_mean - obs_strat_interp
-
-    dropsinde_dict = {
-            "p_sonde_open":p_sonde_open, "sonde_open_mean":sonde_open_mean, "sonde_open_std":sonde_open_std,
-            "p_sonde_strat":p_sonde_strat, "sonde_strat_mean":sonde_strat_mean, "sonde_strat_std":sonde_strat_std,
-            "p_cam_open":p_cam_open, "cam_open_mean":cam_open_mean, "cam_open_std":cam_open_std,
-            "p_cam_strat":p_cam_strat, "cam_strat_mean":cam_strat_mean, "cam_strat_std":cam_strat_std,
-            "p_era_open":p_era_open, "era_open_mean":era_open_mean, "era_open_std":era_open_std,
-            "p_era_strat":p_era_strat, "era_strat_mean":era_strat_mean, "era_strat_std":era_strat_std,
-            "delta_open":delta_open, "delta_strat":delta_strat,
-            "N_open":N_open, "N_strat":N_strat}
-    for donde,donde_val in dropsinde_dict.items():
-        print(f"type({donde}) = {type(donde_val)}")
-
-    # save this case's own CAM profile (and its bias vs Obs) to disk for
-    # later use (e.g. D3/browser); Obs/ERA5 are shared across cases and get
-    # written once by the caller instead.
-    save_named_profile_json(
-        case, campaign, out_dir,
-        p_cam_open, cam_open_mean, cam_open_std,
-        p_cam_strat, cam_strat_mean, cam_strat_std,
-        delta_open=delta_open, delta_strat=delta_strat,
-    )
-
-    return dropsinde_dict
+        (cam[f"p_cam_{key}"], cam[f"cam_{key}_mean"],
+         cam[f"cam_{key}_std"]) = cdog.mean_std_from_profiles(p_cam_raw, cam_arr)
+    return cam
 
 
-def cam_obs_dropsonde_comp(adf, campaign, df_sonde, ds_outs, ds_era5):
+def combine_case_stats(ref, cam):
     """
-    
+    One case's full "enough" entry: the shared Obs/ERA5 profiles, the case's
+    CAM profiles, and its bias vs Obs.
+
+    The bias (CAM - Obs) interpolates the Obs mean onto the case's own CAM
+    pressure grid, the same calculation the Python plotting side does
+    (draw_open_bias/draw_strat_bias in lib/cam_diagnostic.py), so the D3
+    dashboard reads it instead of recomputing it client-side.
+    """
+    delta = {}
+    for key in REGIMES:
+        obs_interp = np.interp(
+            cam[f"p_cam_{key}"][::-1], ref[f"p_sonde_{key}"][::-1], ref[f"sonde_{key}_mean"][::-1],
+        )[::-1]
+        delta[key] = cam[f"cam_{key}_mean"] - obs_interp
+
+    return {
+        "p_sonde_open": ref["p_sonde_open"], "sonde_open_mean": ref["sonde_open_mean"],
+        "sonde_open_std": ref["sonde_open_std"],
+        "p_sonde_strat": ref["p_sonde_strat"], "sonde_strat_mean": ref["sonde_strat_mean"],
+        "sonde_strat_std": ref["sonde_strat_std"],
+        "p_cam_open": cam["p_cam_open"], "cam_open_mean": cam["cam_open_mean"],
+        "cam_open_std": cam["cam_open_std"],
+        "p_cam_strat": cam["p_cam_strat"], "cam_strat_mean": cam["cam_strat_mean"],
+        "cam_strat_std": cam["cam_strat_std"],
+        "p_era_open": ref["p_era_open"], "era_open_mean": ref["era_open_mean"],
+        "era_open_std": ref["era_open_std"],
+        "p_era_strat": ref["p_era_strat"], "era_strat_mean": ref["era_strat_mean"],
+        "era_strat_std": ref["era_strat_std"],
+        "delta_open": delta["open"], "delta_strat": delta["strat"],
+        "N_open": ref["N_open"], "N_strat": ref["N_strat"],
+    }
+
+
+def compute_case_stats(case, ds_out, ds_era5, df_sonde, sonde_var, cam_var, era_var):
+    """
+    Collocate model/obs profiles for a single case and return its "enough"
+    entry. The diagnostic itself caches the reference and CAM parts
+    separately; this computes both, for callers that want one case at once.
+    """
+    ref = compute_reference_stats(ds_era5, df_sonde, sonde_var, era_var)
+    return combine_case_stats(ref, compute_cam_stats(ds_out, df_sonde, cam_var))
+
+
+# Bump when compute_reference_stats/compute_cam_stats change what they
+# compute, so results cached by older code are recomputed (see
+# cdog.cached_source). 2: Obs/ERA5 cached once, separately from each case.
+CACHE_VERSION = 2
+
+
+def cam_obs_dropsonde_comp(adf, campaign, df_sonde, ds_outs, ds_era5, case_info=None):
+    """
+    Dropsonde-vs-CAM (and ERA5) RH profiles, by cloud regime.
+
+    Parameters
+    ----------
+    adf : AdfDiag
+        The ADF object.
+    campaign : str
+        Campaign name.
+    df_sonde : pandas.DataFrame
+        The dropsonde composite. A hash of its contents is part of every
+        cache fingerprint, so rebuilding it with different data recomputes.
+    ds_outs : Mapping
+        {case nickname: CAM dataset}, only indexed for cases not cached yet.
+    ds_era5 : xarray.Dataset
+        ERA5 pressure levels, only read when a case is not cached yet.
+    case_info : dict, optional
+        {case nickname: case details} from inform_model_analysis, used to
+        key each case's cache file by its full case name.
     """
     '''img_base = f'{campaign}__RHvprof_diff_coll__{cam_desc}'
     img_name = f'{img_base}.png'
@@ -305,45 +289,61 @@ def cam_obs_dropsonde_comp(adf, campaign, df_sonde, ds_outs, ds_era5):
     print(f"{msg}\n  {'-' * (len(msg)-3)}")
     yup = Path(adf.config_file_dict["name"])
     plot_loc = Path(adf.plot_location)
-    # pkl cache and JSON exports live alongside the dashboard/html files
+    # JSON exports live alongside the dashboard/html files
     # (created already by AdfWeb.__init__, but mkdir here too to be safe):
     website_dir = plot_loc / "website"
     website_dir.mkdir(parents=True, exist_ok=True)
-    # Qualified by campaign so a config listing multiple campaigns (e.g.
-    # SOCRATES + CSET) doesn't have the second campaign's cases collide
-    # with, or get mistaken for already-cached, the first's:
-    data_pkl = website_dir / f"enough_{campaign}_{yup}.pkl"
     sonde_var = "rh" # tdry, u_wind, v_wind, rh
     cam_var = "RH" # T_K, RH, U, V
     era_var = "RH" # T_K, RH, U, V
 
-    # safe_pickle_load tolerates a missing OR corrupted file (e.g. left
-    # truncated by a previous run that got interrupted mid-write) by
-    # just returning {}, so this one call covers "no cache yet" too:
-    enough = cdog.safe_pickle_load(data_pkl) if Path(data_pkl).is_file() else {}
+    # Cached per source (cdog.cached_source): the Obs/ERA5 reference once per
+    # campaign, and each case's CAM profiles keyed by full case name. Each is
+    # checked against a fingerprint of everything its result depends on.
+    cache_root = cdog.inform_cache_root(adf, campaign)
+    sonde_source = cdog.sonde_cache_source(df_sonde)
+    # Kelvin copy, made only if something actually has to be computed:
+    sonde_K = []
 
-    # Check for any cases not already present in the cache - covers both
-    # a brand new cache (every case missing) and one only partially
-    # filled by a prior, interrupted run (just the remaining cases):
-    missing_cases = [case for case in ds_outs if case not in enough]
-    if missing_cases:
-        print(f"Found new case(s) not in {data_pkl}: {missing_cases}")
+    def _sonde_K():
+        if not sonde_K:
+            sonde_K.append(df_sonde.assign(tdry=df_sonde["tdry"] + 273.15,
+                                           dp=df_sonde["dp"] + 273.15))
+        return sonde_K[0]
 
-        df_sonde["tdry"] = df_sonde["tdry"] + 273.15
-        df_sonde["dp"]   = df_sonde["dp"]   + 273.15
+    # ERA5 is loaded for the campaign's flight window and box, which every
+    # case shares, so any case's entry describes it:
+    window = next(iter((case_info or {}).values()), {})
+    era5_source = {"era5": "d633000 pressure levels",
+                   **{k: window.get(k) for k in ("tmin", "tmax", "lat_slice", "lon_slice")}}
+    ref = cdog.cached_source(
+        cache_root, "dropsonde", campaign, "Obs_ERA5", {"sonde": sonde_source, **era5_source},
+        {"sonde_var": sonde_var, "era_var": era_var, "bin_hPa": 10}, CACHE_VERSION,
+        compute=lambda: compute_reference_stats(ds_era5, _sonde_K(), sonde_var, era_var),
+        label="Obs and ERA5")
 
-        for case in missing_cases:
-            enough[case] = compute_case_stats(
-                case, campaign, website_dir, ds_outs[case], ds_era5, df_sonde, sonde_var, cam_var, era_var
-            )
+    enough = {}
+    for case in ds_outs:
+        key, source = cdog.case_cache_source(case_info, case)
+        cam = cdog.cached_source(
+            cache_root, "dropsonde", campaign, key, source,
+            {"cam_var": cam_var, "sonde": sonde_source}, CACHE_VERSION,
+            compute=lambda case=case: compute_cam_stats(ds_outs[case], _sonde_K(), cam_var),
+            label=case)
+        enough[case] = combine_case_stats(ref, cam)
 
-            # Persist after every case, not just once at the end, so an
-            # interrupted run actually resumes from here next time
-            # instead of silently redoing every case from scratch:
-            cdog.atomic_pickle_dump(enough, data_pkl)
+        # This case's own CAM profile (and its bias vs Obs), for the D3
+        # dashboard; Obs/ERA5 are shared across cases and written once below.
+        stats = enough[case]
+        save_named_profile_json(
+            case, campaign, website_dir,
+            stats["p_cam_open"], stats["cam_open_mean"], stats["cam_open_std"],
+            stats["p_cam_strat"], stats["cam_strat_mean"], stats["cam_strat_std"],
+            delta_open=stats["delta_open"], delta_strat=stats["delta_strat"],
+        )
 
     # Obs/ERA5 are shared across cases, so write them once here rather than
-    # once per case (mirrors the per-case CAM files compute_case_stats writes).
+    # once per case (mirrors the per-case CAM files written above).
     first = next(iter(enough.values()))
     save_named_profile_json(
         "Obs", campaign, website_dir,
@@ -359,7 +359,9 @@ def cam_obs_dropsonde_comp(adf, campaign, df_sonde, ds_outs, ds_era5):
 
     # Combined per-campaign JSON for the D3 dashboard (all cases in `enough`,
     # whichever branch above produced them):
-    save_dropsonde_dashboard_json(campaign, sonde_var, enough, website_dir, yup)
+    dashboard_json = save_dropsonde_dashboard_json(campaign, sonde_var, enough, website_dir, yup)
+    # So the website builds this campaign's interactive dropsonde page:
+    adf.add_inform_page(campaign, "dropsonde", dashboard_json)
 
     #=========================================
     # Figure 1. 3 panels with CAM, ERA5, Obs

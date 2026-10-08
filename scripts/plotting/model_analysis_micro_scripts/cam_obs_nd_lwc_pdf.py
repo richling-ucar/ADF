@@ -123,6 +123,7 @@ def save_nd_lwc_dashboard_json(campaign, Nd_bins, Nd_centers, LWC_bins, LWC_cent
     with open(out_path, "w") as f:
         json.dump(dashboard_json, f, indent=2)
     print(f"Wrote Nd/LWC dashboard JSON: {out_path}")
+    return out_path
 
 
 def compute_obs_pdf_stats(All_rf_df,
@@ -198,60 +199,65 @@ def compute_case_pdf_stats(ds_cam_comp, cam_regime_keys=None,
     }
 
 
-def cam_obs_nd_lwc_pdf(adf, All_rf_df, ds_cams, campaign):
+# Bump when compute_obs_pdf_stats/compute_case_pdf_stats change what they
+# compute, so results cached by older code are recomputed (see
+# cdog.cached_source).
+CACHE_VERSION = 1
+
+
+def cam_obs_nd_lwc_pdf(adf, All_rf_df, ds_cams, campaign, case_info=None):
+    """
+    Obs-vs-CAM Nd and LWC probability distributions, by cloud regime.
+
+    `ds_cams` ({case nickname: regime composites}) is only indexed for cases
+    not cached yet. `case_info` ({case nickname: case details} from
+    inform_model_analysis) keys each case's cache file by its full case name.
+    """
     #Notify user that script has started:
     msg = "\n  Generating CAM-Obs Nd LWC PDF plots..."
     print(f"{msg}\n  {'-' * (len(msg)-3)}")
 
     yup = Path(adf.config_file_dict["name"])
     plot_loc = Path(adf.plot_location)
-    # pkl cache and JSON exports live alongside the dashboard/html files
+    # JSON exports live alongside the dashboard/html files
     # (created already by AdfWeb.__init__, but mkdir here too to be safe):
     website_dir = plot_loc / "website"
     website_dir.mkdir(parents=True, exist_ok=True)
-    # Qualified by campaign so a config listing multiple campaigns (e.g.
-    # SOCRATES + CSET) doesn't have the second campaign's cases collide
-    # with, or get mistaken for already-cached, the first's:
-    data_pkl = website_dir / f"nd_lwc_pdfs_{campaign}_{yup}.pkl"
 
     Nd_bins = np.logspace(-1, 3, 15)
     LWC_bins = np.logspace(-3, 1, 15)
     Nd_centers = np.sqrt(Nd_bins[:-1] * Nd_bins[1:])
     LWC_centers = np.sqrt(LWC_bins[:-1] * LWC_bins[1:])
 
-    # safe_pickle_load tolerates a missing OR corrupted file (e.g. left
-    # truncated by a previous run that got interrupted mid-write) by
-    # just returning {}, so this one call covers "no cache yet" too:
-    enough_pdf = cdog.safe_pickle_load(data_pkl) if data_pkl.is_file() else {}
+    # One cache file per source ("Obs" and each case, keyed by full case
+    # name), checked against a fingerprint of everything the result depends
+    # on (cdog.cached_source):
+    cache_root = cdog.inform_cache_root(adf, campaign)
+    settings = {"Nd_bins": Nd_bins, "LWC_bins": LWC_bins}
 
-    if "Obs" not in enough_pdf:
-        print(f"'Obs' missing from {data_pkl}, computing it.")
-        enough_pdf["Obs"] = compute_obs_pdf_stats(All_rf_df, Nd_bins=Nd_bins, LWC_bins=LWC_bins)
-        cdog.atomic_pickle_dump(enough_pdf, data_pkl)
-
-    # Check for any cases not already present in the cache - covers both
-    # a brand new cache (every case missing) and one only partially
-    # filled by a prior, interrupted run (just the remaining cases):
-    missing_cases = [case for case in ds_cams if case not in enough_pdf]
-    if missing_cases:
-        print(f"Found new case(s) not in {data_pkl}: {missing_cases}")
-        for case in missing_cases:
-            enough_pdf[case] = compute_case_pdf_stats(ds_cams[case], Nd_bins=Nd_bins, LWC_bins=LWC_bins)
-
-            # Persist after every case, not just once at the end, so an
-            # interrupted run actually resumes from here next time
-            # instead of silently redoing every case from scratch:
-            cdog.atomic_pickle_dump(enough_pdf, data_pkl)
+    enough_pdf = {"Obs": cdog.cached_source(
+        cache_root, "nd_lwc_pdf", campaign, "Obs", cdog.obs_cache_source(All_rf_df),
+        settings, CACHE_VERSION,
+        compute=lambda: compute_obs_pdf_stats(All_rf_df, Nd_bins=Nd_bins, LWC_bins=LWC_bins))}
+    for case in ds_cams:
+        key, source = cdog.case_cache_source(case_info, case)
+        enough_pdf[case] = cdog.cached_source(
+            cache_root, "nd_lwc_pdf", campaign, key, source, settings, CACHE_VERSION,
+            compute=lambda case=case: compute_case_pdf_stats(
+                ds_cams[case], Nd_bins=Nd_bins, LWC_bins=LWC_bins),
+            label=case)
 
     # JSON exports: one file per named source (Obs + each CAM case), plus a
     # single combined file for the D3 dashboard.
     for name, pdf_stats in enough_pdf.items():
         save_named_pdf_json(name, campaign, website_dir, Nd_centers, LWC_centers, pdf_stats)
-    save_nd_lwc_dashboard_json(campaign, Nd_bins, Nd_centers, LWC_bins, LWC_centers,
-                                enough_pdf, website_dir, yup)
+    dashboard_json = save_nd_lwc_dashboard_json(campaign, Nd_bins, Nd_centers, LWC_bins,
+                                                LWC_centers, enough_pdf, website_dir, yup)
+    # So the website builds this campaign's interactive Nd/LWC page:
+    adf.add_inform_page(campaign, "nd_lwc_pdf", dashboard_json)
 
     # Skip plot generation entirely when the config has create_html turned
-    # off - the pkl cache and dashboard JSON above are already written
+    # off - the cached stats and dashboard JSON above are already written
     # regardless, so this just avoids an unused PNG and figure work.
     if not adf.create_html:
         print("  create_html is False: skipping Nd/LWC PDF plot generation.")
