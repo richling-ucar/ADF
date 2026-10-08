@@ -2345,7 +2345,7 @@ def write_RF_nc(fblks_cr, rf, campaign, out_dir=None):
 def build_flight_cloud_regime_files(campaign, icf_obj, out_dir, flights=None):
     """
     Build the per-flight cloud regime files from the raw aircraft data: load
-    each research flight (with CCN and 25 Hz sigma_w where configured), block it
+    each research flight (with 25 Hz sigma_w where configured), block it
     into flight maneuvers, collocate the blocks with ERA5 cloud controlling
     factors, label their cloud regimes and write one netCDF file per flight.
 
@@ -2355,7 +2355,8 @@ def build_flight_cloud_regime_files(campaign, icf_obj, out_dir, flights=None):
         "SOCRATES" or "CSET".
     icf_obj : AdfInfo-like
         Object whose `campaigns_dict` gives "air_1hz_dir" and, optionally,
-        "air_25hz_dir" and "ccn_dir" for the campaign (see _campaign_cfg_for).
+        "air_25hz_dir" for the campaign (see _campaign_cfg_for).  "ccn_dir" is
+        not used: like the cookbook, the files carry no CCN.
     out_dir : str or pathlib.Path
         Directory the files are written to.  Each name carries today's date,
         so do not write into a directory that already holds files for the same
@@ -2368,14 +2369,14 @@ def build_flight_cloud_regime_files(campaign, icf_obj, out_dir, flights=None):
     list of str
         The files written.
     """
-    ccn_df = load_ccn_for_campaign(campaign, icf_obj=icf_obj)  # loads once
     flight_paths = find_flight_fnames(campaign, icf_obj=icf_obj)
     if flights is None:
         flights = range(1, len(flight_paths) + 1)
     written = []
     for rf_num in flights:
         i = rf_num - 1
-        df = load_flight_data(campaign, i, ccn_df=ccn_df, icf_obj=icf_obj)
+        # The cookbook loop passes ccn_df=None, so CCN is not merged
+        df = load_flight_data(campaign, i, ccn_df=None, icf_obj=icf_obj)
 
         # RF12 is the only flight with this variable and it messes up the final product
         if ('PLWC' in df.columns) and (campaign == 'SOCRATES'):
