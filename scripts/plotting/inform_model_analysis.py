@@ -28,7 +28,7 @@ import pandas as pd
 import xarray as xr
 import matplotlib.pyplot as plt
 
-import sys, time, json
+import os, sys, time, json, shutil, tempfile
 import functools
 from collections.abc import Mapping
 from glob import glob
@@ -103,9 +103,15 @@ class LazyCases(Mapping):
 
 
 def load_cam_case(cam_dir, file_sel, campaign, tmin, tmax, lat_slice, lon_slice,
-                  composited_data_path):
+                  cache_path=None, cache_fingerprint=None):
     """
     Load one CAM case and build what the diagnostics use from it.
+
+    With `cache_path`, the case's derived fields and regime masks are read
+    from that file when its fingerprint matches `cache_fingerprint`;
+    otherwise they are derived from the history files, saved there, and read
+    back, so a fresh and a cached load give the diagnostics the same data
+    (see cam_diagnostic.read_cam_case_cache/write_cam_case_cache).
 
     Returns
     -------
@@ -114,52 +120,33 @@ def load_cam_case(cam_dir, file_sel, campaign, tmin, tmax, lat_slice, lon_slice,
         "comp": the regime composites (ds_cam_comp).
     """
     t0 = time.perf_counter()
-    #"""
+    if cache_path is not None:
+        cached = cdog.read_cam_case_cache(cache_path, cache_fingerprint)
+        if cached is not None:
+            ds_out, masks = cached
+            ds_cam_comp = cdog.comp_from_masks(ds_out, masks)
+            utils.timer(f"loaded saved CAM data {Path(cache_path).name}", t0)
+            return {"out": ds_out, "comp": ds_cam_comp}
+
     ds_cam = cfun.load_cam_files(cam_dir, file_sel, tmin, tmax, campaign=campaign)
     t0 = utils.timer("loaded ds_cam", t0)
-    """if not Path(f"{composited_data_path}/{campaign}_CAM_microphys_composite.nc").is_file():
-        # Create datasets for CAM state, microphysics and aerosol concentrations based on aircraft instrumentation
-        ds_out = cfun.compute_cam_aerosol_micphys_metrics(ds_cam, lat_slice=lat_slice, lon_slice=lon_slice) # dataset with all the microphysics, state, and aerosol parameters
-        t0 = utils.timer("  loaded microphys_composite: ds_out", t0)
-        ds_out.to_netcdf(f"{composited_data_path}/{campaign}_CAM_microphys_composite.nc")
-    else:
-        print('loaded microphys_composite FROM FILE')
-        ds_out = xr.open_dataset(f"{composited_data_path}/{campaign}_CAM_microphys_composite.nc")"""
-
-    ds_out = cfun.compute_cam_aerosol_micphys_metrics(ds_cam, lat_slice=lat_slice, lon_slice=lon_slice) # dataset with all the microphysics, state, and aerosol parameters
+    # Dataset with all the microphysics, state, and aerosol parameters
+    ds_out = cfun.compute_cam_aerosol_micphys_metrics(ds_cam, lat_slice=lat_slice, lon_slice=lon_slice)
     t0 = utils.timer("loaded ds_out", t0)
-    # Create dataset of CAM cloud controlling factors for compositing of CAM data similar to sonde/aircraft observations
-    ds_cam_ccfs = cfun.load_cam_ccfs(ds_cam, lat_slice=lat_slice, lon_slice=lon_slice) # dataset used for compositing above dataset
+    # CAM cloud controlling factors, for compositing CAM data like the sonde/aircraft observations
+    ds_cam_ccfs = cfun.load_cam_ccfs(ds_cam, lat_slice=lat_slice, lon_slice=lon_slice)
     t0 = utils.timer("loaded ds_cam_ccfs", t0)
-
-    """
-    fils = [f"{composited_data_path}/{campaign}_CAM_microphys_strat_composite.nc",
-            f"{composited_data_path}/{campaign}_CAM_microphys_open_composite.nc",
-            f"{composited_data_path}/{campaign}_CAM_microphys_mask_strat_composite.nc",
-            f"{composited_data_path}/{campaign}_CAM_microphys_mask_open_composite.nc",]
-
-    good = []
-    for fil in fils:
-        if Path(fil).is_file():
-            good.append(fil)
-    if len(good) == len(fils):
-    #if Path(f"{composited_data_path}/{campaign}_CAM_microphys_strat_composite.nc").is_file():
-        ds_strat = xr.open_dataset(f"{composited_data_path}/{campaign}_CAM_microphys_strat_composite.nc")
-        ds_open = xr.open_dataset(f"{composited_data_path}/{campaign}_CAM_microphys_open_composite.nc")
-        mask_strat = xr.open_dataset(f"{composited_data_path}/{campaign}_CAM_microphys_mask_strat_composite.nc")
-        mask_open = xr.open_dataset(f"{composited_data_path}/{campaign}_CAM_microphys_mask_open_composite.nc")
-        ds_cam_comp = {
-            "strat": ds_strat,   # full ds with Qc, Qr, … masked to strat condition
-            "open":  ds_open,    # full ds with Qc, Qr, … masked to open condition
-            "masks": {"strat": mask_strat, "open": mask_open},
-        }
-    else:
-        ds_cam_comp = cfun.subset_cam_by_campaign(ds_out,ds_cam_ccfs,campaign=campaign, nc_savepath=composited_data_path)
-    """
     ds_cam_comp = cfun.subset_cam_by_campaign(ds_out,ds_cam_ccfs,campaign=campaign)
     t0 = utils.timer("loaded ds_cam_comp", t0)
 
-    return {"out": ds_out, "comp": ds_cam_comp}
+    if cache_path is None:
+        return {"out": ds_out, "comp": ds_cam_comp}
+
+    print(f"  Saving CAM data for the diagnostics to {cache_path}")
+    cdog.write_cam_case_cache(cache_path, ds_out, ds_cam_comp["masks"], cache_fingerprint)
+    t0 = utils.timer("saved CAM data", t0)
+    ds_out, masks = cdog.read_cam_case_cache(cache_path, cache_fingerprint)
+    return {"out": ds_out, "comp": cdog.comp_from_masks(ds_out, masks)}
 
 def load_nc_cldrgme(file_paths):
     """
@@ -198,6 +185,60 @@ def load_nc_cldrgme(file_paths):
     all_blocks = pd.concat(combined_blocks, ignore_index=True)
     return all_blocks
 
+def build_flight_files(adfobj, campaign, flight_dir, idx, reason):
+    """
+    Build a campaign's per-flight cloud regime files from its raw aircraft data.
+
+    The files are built into a new directory beside ``flight_dir``, which
+    replaces ``flight_dir`` once every flight is written.  Their names carry
+    the build date, so building over old files would leave two of each flight
+    for the ``*RF*.nc`` glob, and an interrupted build leaves ``flight_dir``
+    as it was.
+
+    Parameters
+    ----------
+    adfobj : AdfDiag
+        The diagnostics object; its ``campaigns_dict`` gives ``air_1hz_dir``
+        and, optionally, ``air_25hz_dir``.
+    campaign : str
+        "SOCRATES" or "CSET".
+    flight_dir : pathlib.Path
+        Directory that holds the campaign's flight files.
+    idx : int
+        The campaign's position in the config's campaigns section.
+    reason : str
+        Why the files are being built, for the log line.
+
+    Returns
+    -------
+    list of str
+        The flight files, sorted.
+    """
+    air_dirs = adfobj.campaigns_dict.get("air_1hz_dir") or []
+    if idx >= len(air_dirs) or not air_dirs[idx]:
+        adfobj.end_diag_fail(f"build_flight_files is set for {campaign}, but the config's "
+                             "campaigns section has no 'air_1hz_dir' to build them from.")
+    flight_dir.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f".{flight_dir.name}.building-", dir=flight_dir.parent))
+    print(f"\nBuilding {campaign} per-flight cloud regime files in {flight_dir} ({reason})")
+    t0 = time.perf_counter()
+    try:
+        inform.build_flight_cloud_regime_files(campaign, adfobj, tmp_dir)
+    except BaseException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    file_names = sorted(p.name for p in tmp_dir.glob(f"*{campaign}*RF*.nc"))
+    if not file_names:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        adfobj.end_diag_fail(f"No {campaign} flight files were built from {air_dirs[idx]}")
+    old_dir = flight_dir.with_name(f".{flight_dir.name}.old-{os.getpid()}")
+    if flight_dir.exists():
+        flight_dir.rename(old_dir)
+    tmp_dir.rename(flight_dir)
+    shutil.rmtree(old_dir, ignore_errors=True)
+    t0 = utils.timer(f"built {len(file_names)} flight files", t0)
+    return [str(flight_dir / name) for name in file_names]
+
 def inform_model_analysis(adfobj):
     """
     Run the INFORM campaign cloud micro analysis.
@@ -223,7 +264,8 @@ def inform_model_analysis(adfobj):
     macro_diag_dir = Path("scripts/plotting/model_analysis_macro_scripts/")
     macro_all_files = sorted(macro_diag_dir.glob(f"*.py"))
     print(macro_all_files)
-    macro_filtered_files = [f for f in macro_all_files if (f.name != '__init__.py') or (f.name != 'cam_obs_dropsonde_comp_ryan.py')]
+    macro_filtered_files = [f for f in macro_all_files
+                            if f.name not in ('__init__.py', 'cam_obs_dropsonde_comp_ryan.py')]
     print("\nMACRO WOWSA:  -> ",macro_filtered_files,"\n-------------------------------------\n")
 
     process_diag_dir = Path("scripts/plotting/model_analysis_process_scripts/")
@@ -237,6 +279,9 @@ def inform_model_analysis(adfobj):
                  "macro":"",
                  "process":""}
 
+    # Tiers requested in the dict form of the plotting_scripts entry, e.g.
+    #   - inform_model_analysis: [micro, macro, process]
+    req_diags = []
     for i,item in enumerate(adfobj.plotting_scripts):
         if type(item)==dict:
             #print(item,item.keys())
@@ -249,6 +294,10 @@ def inform_model_analysis(adfobj):
                         req_diags.append(diag_type)
 
     print(req_diags)
+    if not req_diags:
+        print("\tNo INFORM diagnostics requested: list micro, macro and/or process under "
+              "'inform_model_analysis' in plotting_scripts. Skipping INFORM model analysis.")
+        return
     #sys.exit()
     # Additional analyses can be added here as needed
     print('\nStarting COMPASS model analysis plots.')
@@ -259,6 +308,7 @@ def inform_model_analysis(adfobj):
     #print("campaigns_defaults",campaigns_defaults)
     #models_dict = adfobj.model_dict
     cam_hist_locs = adfobj.get_cam_info("cam_hist_loc")
+    cam_case_names = adfobj.get_cam_info("cam_case_name")
     #for cam_path in ["/glade/derecho/scratch/islas/archive/f.e30_cam6_4_120.FHIST_BGC.f09_f09_mg17.SOCRATES_nudgeUVTfull_withCOSP_tau6h.002/atm/hist"]:
     for idx,campaign in enumerate(campaigns):
         #composited_data_path = Path(campaigns_defaults[campaign]["composited_data"])
@@ -266,15 +316,28 @@ def inform_model_analysis(adfobj):
         # Find all flight data files for this campaign
         composited_data_path.mkdir(parents=True, exist_ok=True)
 
-        campaign_data_path = Path(campaigns_defaults["campaign_data"][idx])
+        # redo_composited rebuilds every composite below (the ADF-built flight
+        # files, the flight table and the sondes)
+        redo_list = campaigns_defaults.get("redo_composited") or []
+        redo = bool(redo_list[idx]) if idx < len(redo_list) else False
 
-        # Individual flight data files
-        file_paths = sorted(glob(f"{campaign_data_path}/*{campaign}*RF*.nc"))
+        # Individual flight data files: with build_flight_files, the ADF builds
+        # them from the raw aircraft data into the INFORM cache, shared by the
+        # configs that share it; otherwise they are read from campaign_data.
+        build_list = campaigns_defaults.get("build_flight_files") or []
+        if idx < len(build_list) and build_list[idx]:
+            flight_dir = cdog.inform_cache_root(adfobj, campaign) / "flights" / campaign
+            file_paths = sorted(glob(f"{flight_dir}/*{campaign}*RF*.nc"))
+            if redo or not file_paths:
+                file_paths = build_flight_files(adfobj, campaign, flight_dir, idx,
+                                                "redo_composited" if redo else "not built yet")
+        else:
+            campaign_data_path = Path(campaigns_defaults["campaign_data"][idx])
+            file_paths = sorted(glob(f"{campaign_data_path}/*{campaign}*RF*.nc"))
 
-        #TODO: add check for all flight files being present, and if not, print a warning and exit.
-        if not file_paths:
-            print(f"No files found for campaign {campaign} in path {campaign_data_path}???")
-            sys.exit(0)
+            #TODO: add check for all flight files being present, and if not, print a warning and exit.
+            if not file_paths:
+                adfobj.end_diag_fail(f"No flight files (*{campaign}*RF*.nc) found for campaign {campaign} in {campaign_data_path}")
 
         if campaign == 'SOCRATES':
             lat_slice = slice(-62, -42)
@@ -283,13 +346,29 @@ def inform_model_analysis(adfobj):
             lat_slice = slice(15, 45)
             lon_slice = slice(200, 240)
 
-        # Load combined flight data
-        #All_rf_df = pd.read_csv(f"{composited_data_path}/{campaign}_combined_RF_data.csv")
-        if not Path(f"{composited_data_path}/{campaign}_combined_RF_data.csv").is_file():
-            All_rf_df = load_nc_cldrgme(file_paths)
-            All_rf_df.to_csv(f"{composited_data_path}/{campaign}_combined_RF_data.csv", index=False)
-        else:
-            All_rf_df = pd.read_csv(f"{composited_data_path}/{campaign}_combined_RF_data.csv")
+        # Combined flight data. A sidecar lists the flight files (name, size,
+        # mtime) the CSV was built from; it is rebuilt when that list changes,
+        # when it has no sidecar, or with redo_composited. Like the sonde
+        # composite, it is always read back from the file, so a run that builds
+        # it and a run that reuses it see exactly the same data.
+        rf_csv = composited_data_path / f"{campaign}_combined_RF_data.csv"
+        rf_sources = rf_csv.with_name(rf_csv.name + ".sources.json")
+        built_from = [{"file": Path(p).name, "size": Path(p).stat().st_size,
+                       "mtime_ns": Path(p).stat().st_mtime_ns} for p in file_paths]
+        try:
+            stored = json.loads(rf_sources.read_text())
+        except (OSError, ValueError):
+            stored = None
+        if redo or not rf_csv.is_file() or stored != built_from:
+            reason = ("redo_composited" if redo else "not built yet" if not rf_csv.is_file()
+                      else "no record of its flight files" if stored is None
+                      else "flight files changed")
+            print(f"\nBuilding {rf_csv.name} ({reason})")
+            tmp_csv = rf_csv.with_name(rf_csv.name + ".tmp")
+            load_nc_cldrgme(file_paths).to_csv(tmp_csv, index=False)
+            os.replace(tmp_csv, rf_csv)
+            rf_sources.write_text(json.dumps(built_from, indent=1))
+        All_rf_df = pd.read_csv(rf_csv)
 
         df_sonde = None
         if "macro" in req_diags:
@@ -298,8 +377,6 @@ def inform_model_analysis(adfobj):
             # It is always read back from the file, so a run that builds it and
             # a run that reuses it see exactly the same data.
             sonde_file = composited_data_path / f"{campaign}_sonde_data_composite.nc"
-            redo_list = campaigns_defaults.get("redo_composited") or []
-            redo = bool(redo_list[idx]) if idx < len(redo_list) else False
             if redo or not sonde_file.is_file():
                 sonde_dirs = campaigns_defaults.get("campn_sonde_dir") or []
                 if idx >= len(sonde_dirs) or not sonde_dirs[idx]:
@@ -335,7 +412,12 @@ def inform_model_analysis(adfobj):
             functools.partial(cfun.load_era5_files, tmin, tmax, lat_slice, lon_slice),
             f"ERA5 for {campaign}")
 
+        cache_root = cdog.inform_cache_root(adfobj, campaign)
         case_loaders = {}
+        # {nickname: details}: the diagnostics key each case's cache file by
+        # its full case name and fingerprint it with these (see
+        # cam_diagnostic.cached_source).
+        case_info = {}
         for case_idx,cam_path in enumerate(cam_hist_locs):
             cam_dir = Path(cam_path)
             print("\ncam_dir",cam_dir)
@@ -348,9 +430,23 @@ def inform_model_analysis(adfobj):
             print("CAM case description:",cam_desc)
             print("CAM case history num:",file_sel,"\n")
 
+            if cam_desc in case_info:
+                raise ValueError(f"Case nickname '{cam_desc}' is used by more than one case; "
+                                 "INFORM diagnostics need unique case_nickname values.")
+            case_info[cam_desc] = {
+                "case_name": cam_case_names[case_idx],
+                "hist_str": file_sel,
+                "cam_hist_loc": str(cam_dir),
+                "tmin": tmin, "tmax": tmax,
+                "lat_slice": lat_slice, "lon_slice": lon_slice,
+            }
+            # Each case's derived CAM data is saved in the INFORM cache too, so
+            # a later run that needs this case doesn't re-read its history files:
+            cache_key, cache_source = cdog.case_cache_source(case_info, cam_desc)
             case_loaders[cam_desc] = functools.partial(
-                load_cam_case, cam_dir, file_sel, campaign, tmin, tmax,
-                lat_slice, lon_slice, composited_data_path)
+                load_cam_case, cam_dir, file_sel, campaign, tmin, tmax, lat_slice, lon_slice,
+                cache_path=cdog.cam_case_cache_path(cache_root, campaign, cache_key),
+                cache_fingerprint=cdog.cam_case_fingerprint(cache_source))
 
         loaded_cases = {}
         ds_cams = LazyCases(case_loaders, "comp", loaded_cases)
@@ -365,15 +461,15 @@ def inform_model_analysis(adfobj):
         for diag in req_diags:
             if diag == "macro":
                 from model_analysis_macro_scripts import cam_obs_dropsonde_comp
-                cam_obs_dropsonde_comp(adfobj, campaign, df_sonde, ds_outs, ds_era5)
+                cam_obs_dropsonde_comp(adfobj, campaign, df_sonde, ds_outs, ds_era5, case_info)
             if diag == "micro":
                 from model_analysis_micro_scripts import cam_obs_nd_lwc_pdf
-                cam_obs_nd_lwc_pdf(adfobj, All_rf_df, ds_cams, campaign)
+                cam_obs_nd_lwc_pdf(adfobj, All_rf_df, ds_cams, campaign, case_info)
             if campaign == "SOCRATES":
                 if diag == "process":
                     from model_analysis_process_scripts import alpha_sigmaw_regime_comparison_2x2,sensitivity_vs_sigmaw_2x2_obs_cam
-                    sensitivity_vs_sigmaw_2x2_obs_cam(adfobj, All_rf_df, ds_cams, campaign)
-                    alpha_sigmaw_regime_comparison_2x2(adfobj, All_rf_df, ds_cams, campaign, cam_desc)
+                    sensitivity_vs_sigmaw_2x2_obs_cam(adfobj, All_rf_df, ds_cams, campaign, case_info)
+                    alpha_sigmaw_regime_comparison_2x2(adfobj, All_rf_df, ds_cams, campaign, case_info)
 
         #for a in req_diags:
         #    for b in plot_dict[a]:
