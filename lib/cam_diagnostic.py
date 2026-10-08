@@ -1,4 +1,7 @@
 import os
+import re
+import json
+import hashlib
 import pickle
 import xarray as xr
 import numpy as np
@@ -55,8 +58,8 @@ def disk_size(obj, name="data"):
 # across many cases, so a long-running job that gets interrupted (e.g. a
 # dropped connection) needs to actually resume from whatever cases already
 # finished, rather than silently redoing everything on the next attempt.
-# See the per-script pkl caches (enough_*.pkl, nd_lwc_pdfs_*.pkl,
-# sensitivity_vs_sigmaw_*.pkl) that call these two helpers.
+# See cached_source() below, which every INFORM diagnostic uses for its
+# per-source result cache and which calls these two helpers.
 
 def safe_pickle_load(path):
     """
@@ -86,6 +89,250 @@ def atomic_pickle_dump(obj, path):
     with open(tmp_path, "wb") as f:
         pickle.dump(obj, f)
     os.replace(tmp_path, path)
+
+
+# =============================================================================
+# 0c. PER-SOURCE RESULT CACHE (shared across configs)
+# =============================================================================
+# Each diagnostic caches one file per source - "Obs" or one CAM case - at
+#   {cache root}/{diagnostic}/{campaign}__{source key}.pkl
+# where a CAM case's key is its full case name (cam_case_name), not its
+# nickname. Each file stores a fingerprint of everything its result depends
+# on (case name, history stream and location, time/space window, the
+# diagnostic's settings and a version number); a fingerprint that no longer
+# matches the current run is recomputed. So configs that share a cache root
+# reuse each other's results for the same case, while a renamed nickname,
+# a different window or new settings can never pick up a stale result.
+
+def inform_cache_root(adf, campaign):
+    """
+    Root directory for the INFORM diagnostics' result caches.
+
+    Uses the config's campaigns-section ``inform_cache_dir`` (one path for
+    all campaigns, or a list with one per campaign) when set; otherwise
+    ``{composited_data}/inform_cache`` for the campaign; otherwise
+    ``{plot_location}/inform_cache``.
+    """
+    try:
+        campaigns = adf.campaigns_dict or {}
+    except AttributeError:
+        campaigns = {}
+    names = campaigns.get("name") or []
+    idx = names.index(campaign) if campaign in names else None
+
+    def _for_campaign(value):
+        if isinstance(value, (list, tuple)):
+            return value[idx] if idx is not None and idx < len(value) else None
+        return value
+
+    cache_dir = _for_campaign(campaigns.get("inform_cache_dir"))
+    if cache_dir:
+        return Path(cache_dir)
+    composited = _for_campaign(campaigns.get("composited_data"))
+    if composited:
+        return Path(composited) / "inform_cache"
+    return Path(adf.plot_location) / "inform_cache"
+
+
+def _canonical(obj):
+    """JSON-normalize a fingerprint so equal settings always compare equal."""
+    def _default(o):
+        if hasattr(o, "tolist"):
+            return o.tolist()
+        if isinstance(o, slice):
+            return [o.start, o.stop, o.step]
+        return str(o)
+    return json.loads(json.dumps(obj, sort_keys=True, default=_default))
+
+
+def case_cache_source(case_info, nickname):
+    """
+    Return (cache key, source fingerprint) for the CAM case shown as `nickname`.
+
+    `case_info` maps nickname -> {"case_name", "hist_str", "cam_hist_loc",
+    "tmin", "tmax", "lat_slice", "lon_slice"}, as built by
+    inform_model_analysis. Without an entry for `nickname` the nickname
+    itself is the key, so callers that pass no case info still work.
+    """
+    info = (case_info or {}).get(nickname)
+    if not info:
+        return nickname, {"case_name": nickname}
+    return info["case_name"], dict(info)
+
+
+def sonde_cache_source(df_sonde):
+    """
+    Source fingerprint for the dropsonde composite, from its contents (not
+    its path), so configs with identical composites share cached results.
+    """
+    digest = hashlib.sha256(pd.util.hash_pandas_object(df_sonde, index=True).values.tobytes())
+    return {"sonde_composite_sha256": digest.hexdigest(), "rows": len(df_sonde)}
+
+
+def obs_cache_source(All_rf_df):
+    """
+    Source fingerprint for "Obs" computed from the combined flight table,
+    from its contents (like sonde_cache_source), so regenerated flight files
+    with new values (e.g. cloud_regime, EIS) recompute the Obs results.
+
+    The hash is kept in the table's attrs, so the diagnostics that each call
+    this hash the table once per run. It is tagged with the table's id():
+    pandas copies attrs onto filtered/derived frames, which must not reuse it.
+    """
+    memo = All_rf_df.attrs.get("inform_sha256")
+    if memo is not None and memo[0] == id(All_rf_df):
+        digest = memo[1]
+    else:
+        digest = hashlib.sha256(
+            pd.util.hash_pandas_object(All_rf_df, index=False).values.tobytes()).hexdigest()
+        All_rf_df.attrs["inform_sha256"] = (id(All_rf_df), digest)
+    return {"obs": "combined flight table", "flight_table_sha256": digest,
+            "rows": len(All_rf_df)}
+
+
+def cached_source(cache_root, diagnostic, campaign, key, source, settings, version,
+                  compute, label=None):
+    """
+    Return one source's result for one diagnostic, from its cache file when
+    the stored fingerprint matches, otherwise from compute() (then cached).
+
+    Parameters
+    ----------
+    cache_root : str or Path
+        From inform_cache_root().
+    diagnostic : str
+        Subdirectory name for the diagnostic, e.g. "nd_lwc_pdf".
+    campaign : str
+        Campaign name, part of the file name.
+    key : str
+        "Obs" or the CAM case's full case name.
+    source : dict
+        What the source data depends on (from case_cache_source or
+        obs_cache_source).
+    settings : dict
+        The diagnostic's settings that affect the result.
+    version : int
+        Bump in the diagnostic when its computation changes, so results
+        cached by older code are recomputed.
+    compute : callable
+        Called with no arguments to produce the result on a cache miss.
+    label : str, optional
+        Name to print instead of `key` (e.g. the case nickname).
+    """
+    safe_key = re.sub(r"[^\w.+-]", "_", str(key))
+    path = Path(cache_root) / diagnostic / f"{campaign}__{safe_key}.pkl"
+    fingerprint = _canonical({"version": version, "source": source, "settings": settings})
+
+    entry = safe_pickle_load(path) if path.is_file() else {}
+    if isinstance(entry, dict) and entry.get("fingerprint") == fingerprint:
+        return entry["stats"]
+
+    reason = "settings or source changed" if entry else "not cached yet"
+    print(f"  {diagnostic}: computing {label or key} ({reason}) -> {path}")
+    stats = compute()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_pickle_dump({"key": str(key), "label": label, "fingerprint": fingerprint,
+                        "stats": stats}, path)
+    return stats
+
+
+# -----------------------------------------------------------------------------
+# Per-case CAM data cache
+# -----------------------------------------------------------------------------
+# Loading a CAM case (open the history files, derive the microphysics and
+# state fields, the cloud-controlling factors and the regime masks) is the
+# slowest step, and any diagnostic missing that case repeats it. So the case's
+# derived fields that the diagnostics read, plus its two regime masks, are
+# saved once per case at
+#   {cache root}/cam/{campaign}__{case name}.nc
+# with the same kind of fingerprint as cached_source (in the file's
+# attributes). The regime composites are rebuilt from the masks on load.
+
+# Bump when compute_cam_aerosol_micphys_metrics, load_cam_ccfs or
+# subset_cam_by_campaign change what they compute, so saved CAM data from
+# older code is rebuilt.
+CAM_CACHE_VERSION = 1
+
+# The ds_out fields the INFORM diagnostics read: RH (dropsonde) and the
+# Nd/LWC PDF and sensitivity inputs.
+CAM_CACHE_VARS = ("RH", "T_K", "cam_lwc", "cam_Nc", "cam_N_UHSAS", "sigma_w", "cam_Nr")
+
+
+def cam_case_cache_path(cache_root, campaign, key):
+    """Where one case's saved CAM data lives (see read/write_cam_case_cache)."""
+    safe_key = re.sub(r"[^\w.+-]", "_", str(key))
+    return Path(cache_root) / "cam" / f"{campaign}__{safe_key}.nc"
+
+
+def cam_case_fingerprint(source, variables=CAM_CACHE_VARS):
+    """Fingerprint for a case's saved CAM data, from case_cache_source's source."""
+    return _canonical({"version": CAM_CACHE_VERSION, "source": source,
+                       "settings": {"variables": list(variables)}})
+
+
+def read_cam_case_cache(path, fingerprint):
+    """
+    Return (ds_out, masks) from a case's saved CAM data, or None when the file
+    is missing, unreadable or was saved with a different fingerprint.
+
+    ds_out holds only the saved fields; masks is {"strat": ..., "open": ...}.
+    Both are opened lazily (dask-backed), as freshly derived data would be.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        ds_out = xr.open_dataset(path, chunks={})
+        stored = ds_out.attrs.get("inform_fingerprint")
+        if stored is None or json.loads(stored) != _canonical(fingerprint):
+            ds_out.close()
+            return None
+        masks = xr.open_dataset(path, group="masks", chunks={})
+    except (OSError, ValueError, KeyError) as e:
+        print(f"WARNING: could not read saved CAM data '{path}' ({e}); rebuilding it.")
+        return None
+    return ds_out, {"strat": masks["mask_strat"], "open": masks["mask_open"]}
+
+
+def write_cam_case_cache(path, ds_out, masks, fingerprint, variables=CAM_CACHE_VARS):
+    """
+    Save a case's derived fields and regime masks (from subset_cam_by_campaign)
+    to `path`, computing them from the history files as it writes.
+
+    Written to a temporary file first and then moved into place, so an
+    interrupted run never leaves a partial file for the next run to read.
+    Fields keep their precision; compression is lossless.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    out = ds_out[list(variables)]
+    out.attrs = {**ds_out.attrs,
+                 "inform_fingerprint": json.dumps(_canonical(fingerprint), sort_keys=True)}
+    encoding = {v: {"zlib": True, "complevel": 1} for v in variables}
+    try:
+        out.to_netcdf(tmp_path, mode="w", encoding=encoding)
+        xr.Dataset({"mask_strat": masks["strat"], "mask_open": masks["open"]}).to_netcdf(
+            tmp_path, mode="a", group="masks")
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def comp_from_masks(ds_out, masks):
+    """
+    Rebuild subset_cam_by_campaign's regime composites from its saved masks:
+    the same inner alignment and masking, without recomputing the CCFs.
+    """
+    mask_strat = masks["strat"].compute()
+    mask_open = masks["open"].compute()
+    ds_aln, mask_strat, mask_open = xr.align(ds_out, mask_strat, mask_open, join="inner")
+    return {
+        "strat": ds_aln.where(mask_strat, drop=True),
+        "open": ds_aln.where(mask_open, drop=True),
+        "masks": {"strat": mask_strat, "open": mask_open},
+    }
 
 
 # =============================================================================
@@ -346,6 +593,80 @@ def collocate_model_profiles_for_regime(
     t0 = utils.timer("loaded:  collocate_model_profiles_for_regime", t0)
 
     return df_reg, p_cam_ref, cam_arr, p_era_ref, era_arr
+
+
+def collocate_profiles_for_regime(
+    df_sonde,
+    ds,
+    regime_name,
+    var="RH",
+    lat_name="lat",
+    lon_name="lon",
+    lev_name="lev",
+    time_col="Time",
+    lat_col="GGLAT",
+    lon_col="GGLON",
+    drop_col="drop_num",
+    flight_col="RF",
+    to_percent=True,
+    label="model",
+):
+    """
+    Collocate ONE model dataset with every dropsonde in `regime_name`.
+
+    Same selection and column extraction as collocate_model_profiles_for_regime,
+    which does CAM and ERA5 together; this lets the dropsonde diagnostic
+    collocate ERA5 once per campaign and each CAM case on its own.
+
+    Returns
+    -------
+    df_reg : pandas.DataFrame
+        The sonde rows in this regime.
+    p_ref : numpy.ndarray
+        The dataset's pressure levels (hPa).
+    arr : numpy.ndarray
+        Columns at each sonde, shape (n_drops, n_lev).
+    """
+    df_reg = df_sonde[df_sonde.cloud_regime == regime_name].copy()
+
+    cols = []
+    p_ref = None
+    t0 = time.perf_counter()
+    for (rf, drop), sub in df_reg.groupby([flight_col, drop_col]):
+        if sub.empty:
+            continue
+
+        # Drop NaNs in GGLAT / GGLON (top of sonde always has NaNs)
+        sub_valid = sub.dropna(subset=[lat_col, lon_col])
+        if sub_valid.empty:
+            print(f"WARNING No valid lat/lon for RF={rf}, drop={drop}, skipping")
+            continue
+
+        # Surface point of the sonde sets the column's location/time
+        row = sub_valid.iloc[-1]
+        p, da = get_model_column_raw(
+            ds,
+            var=var,
+            time=np.datetime64(row[time_col]),
+            lat=float(row[lat_col]),
+            lon=float(row[lon_col]),
+            time_name="time",
+            lat_name=lat_name,
+            lon_name=lon_name,
+            lev_name=lev_name,
+            to_percent=to_percent,
+        )
+
+        if p_ref is None:
+            p_ref = p
+        elif not np.allclose(p_ref, p):
+            raise ValueError(f"{label} pressure levels not consistent across columns")
+
+        # compute each column immediately (small graph)
+        cols.append(da.load().values)
+
+    utils.timer(f"collocated {label} for {regime_name}", t0)
+    return df_reg, p_ref, np.vstack(cols)
 
 # =============================================================================
 # 4. MEAN / STD FROM MODEL PROFILE MATRIX
@@ -676,10 +997,8 @@ def dropsonde_cam_obs_2x2(
                   "p_cam_strat":p_cam_strat, "cam_strat_mean":cam_strat_mean, "cam_strat_std":cam_strat_std,
                   "N_open":N_open, "N_strat":N_strat}"""
     #if len(enough.keys()) > 1:
-    lens = []
-    for case_name in enough.keys():
-        max_chars = max(len(lbl) for lbl in case_name)
-        lens.append(max_chars)
+    # Legend column width grows with the longest case label
+    lens = [len(name) for name in enough]
     label_width = max(0.5, max(lens) / 20)
 
     
@@ -942,10 +1261,8 @@ def plot_three_panels_cam_obs_delta_cam_minus_obs(
                   "p_cam_strat":p_cam_strat, "cam_strat_mean":cam_strat_mean, "cam_strat_std":cam_strat_std,
                   "N_open":N_open, "N_strat":N_strat}"""
     #if len(enough.keys()) > 1:
-    lens = []
-    for case_name in enough.keys():
-        max_chars = max(len(lbl) for lbl in case_name)
-        lens.append(max_chars)
+    # Legend column width grows with the longest case label
+    lens = [len(name) for name in enough]
     label_width = max(0.5, max(lens) / 20)
 
     
@@ -2616,10 +2933,8 @@ def plot_sensitivity_vs_sigmaw_2x2_obs_cam(
 
     from matplotlib.gridspec import GridSpec
 
-    lens = []
-    for case_name in cam_outs.keys():
-        max_chars = max(len(lbl) for lbl in case_name)
-        lens.append(max_chars)
+    # Legend column width grows with the longest case label
+    lens = [len(name) for name in cam_outs]
     label_width = max(0.5, max(lens) / 20) if lens else 0.5
 
     fig = plt.figure(figsize=figsize)
